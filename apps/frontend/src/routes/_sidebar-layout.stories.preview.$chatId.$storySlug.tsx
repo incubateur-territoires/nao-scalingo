@@ -15,6 +15,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import { trpc } from '@/main';
 import { StoryDownload } from '@/components/story-download';
 import { SelectionProvider } from '@/contexts/text-selection';
+import { StoryChartEditProvider } from '@/contexts/story-chart-edit';
 import { chatPendingCitationStore } from '@/stores/chat-pending-citation';
 import { useChatActivity } from '@/hooks/use-chat-activity';
 
@@ -56,6 +57,7 @@ function StoryPreviewPage() {
 	);
 
 	const cachedAt = story.cachedAt ? new Date(story.cachedAt as unknown as string) : null;
+	const canEditCharts = !story.archivedAt;
 
 	return (
 		<div className='flex flex-col flex-1 h-full overflow-hidden bg-panel min-w-0'>
@@ -129,14 +131,39 @@ function StoryPreviewPage() {
 
 			<SelectionProvider key={storySlug}>
 				<HighlightBubble onAsk={handleSelectionAsk} disabled={isChatRunning} />
-				<PreviewContent
-					code={story.code}
-					queryData={story.queryData as QueryDataMap | null}
-					chatId={chatId}
-					cacheSchedule={story.cacheSchedule}
-				/>
+				{renderWithChartEditProvider(
+					canEditCharts,
+					{ chatId, storySlug, storyTitle: story.title, storyCode: story.code },
+					<PreviewContent
+						code={story.code}
+						queryData={story.queryData as QueryDataMap | null}
+						chatId={chatId}
+						cacheSchedule={story.cacheSchedule}
+					/>,
+				)}
 			</SelectionProvider>
 		</div>
+	);
+}
+
+function renderWithChartEditProvider(
+	enabled: boolean,
+	params: { chatId: string; storySlug: string; storyTitle: string; storyCode: string },
+	children: React.ReactNode,
+) {
+	if (!enabled) {
+		return children;
+	}
+
+	return (
+		<StoryChartEditProvider
+			chatId={params.chatId}
+			storySlug={params.storySlug}
+			storyTitle={params.storyTitle}
+			storyCode={params.storyCode}
+		>
+			{children}
+		</StoryChartEditProvider>
 	);
 }
 
