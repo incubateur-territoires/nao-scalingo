@@ -145,12 +145,13 @@ class TestSetupProjectName:
         monkeypatch.chdir(tmp_path)
         mock_ask_text.return_value = "new-project"
 
-        name, path, existing = setup_project_name()
+        name, path, existing, created = setup_project_name()
 
         assert name == "new-project"
         assert path.name == "new-project"
         assert path.exists()
         assert existing is None
+        assert created is True
 
     @patch("nao_core.commands.init.ask_text")
     def test_raises_on_empty_project_name(self, mock_ask_text, tmp_path: Path, monkeypatch):
@@ -180,11 +181,12 @@ class TestSetupProjectName:
         (tmp_path / "existing-project").mkdir()
         mock_ask_text.return_value = "existing-project"
 
-        name, path, existing = setup_project_name(force=True)
+        name, path, existing, created = setup_project_name(force=True)
 
         assert name == "existing-project"
         assert path.exists()
         assert existing is None
+        assert created is False
 
     @patch("nao_core.commands.init.ask_confirm")
     @patch("nao_core.commands.init.NaoConfig.try_load")
@@ -200,11 +202,12 @@ class TestSetupProjectName:
         mock_try_load.return_value = mock_config
         mock_confirm.return_value = True
 
-        name, path, existing = setup_project_name()
+        name, path, existing, created = setup_project_name()
 
         assert name == "existing"
         assert path == tmp_path
         assert existing == mock_config
+        assert created is False
 
     @patch("nao_core.commands.init.ask_confirm")
     @patch("nao_core.commands.init.NaoConfig.try_load")
@@ -472,7 +475,7 @@ class TestInitCommand:
         project_path = tmp_path / "test-project"
         project_path.mkdir()
 
-        mock_setup_project_name.return_value = ("test-project", project_path, None)
+        mock_setup_project_name.return_value = ("test-project", project_path, None, True)
         mock_prompt_config.return_value = NaoConfig(
             project_name="test-project",
             databases=[],
@@ -504,7 +507,7 @@ class TestInitCommand:
         project_path.mkdir()
 
         existing_config = NaoConfig(project_name="existing-project")
-        mock_setup_project_name.return_value = ("existing-project", project_path, existing_config)
+        mock_setup_project_name.return_value = ("existing-project", project_path, existing_config, False)
         mock_prompt_config.return_value = NaoConfig(
             project_name="existing-project",
             databases=[],
@@ -539,7 +542,7 @@ class TestInitCommand:
         project_path = tmp_path / "test-project"
         project_path.mkdir()
 
-        mock_setup_project_name.return_value = ("test-project", project_path, None)
+        mock_setup_project_name.return_value = ("test-project", project_path, None, True)
         mock_prompt_config.return_value = NaoConfig(
             project_name="test-project",
             databases=[DuckDBConfig(name="test-db", path=":memory:")],
@@ -571,7 +574,7 @@ class TestInitCommand:
         project_path = tmp_path / "test-project"
         project_path.mkdir()
 
-        mock_setup_project_name.return_value = ("test-project", project_path, None)
+        mock_setup_project_name.return_value = ("test-project", project_path, None, True)
         mock_prompt_config.return_value = NaoConfig(
             project_name="test-project",
             databases=[],
@@ -601,7 +604,7 @@ class TestInitCommand:
         project_path = tmp_path / "test-project"
         project_path.mkdir()
 
-        mock_setup_project_name.return_value = ("test-project", project_path, None)
+        mock_setup_project_name.return_value = ("test-project", project_path, None, True)
         mock_prompt_config.return_value = NaoConfig(
             project_name="test-project",
             databases=[],
@@ -632,6 +635,149 @@ class TestInitCommand:
         calls = [str(c) for c in mock_ui.error.call_args_list]
         assert any("cannot be empty" in c for c in calls)
 
+    @patch("nao_core.commands.init.NaoConfig.promptConfig")
+    @patch("nao_core.commands.init.setup_project_name")
+    @patch("nao_core.commands.init.UI")
+    def test_init_cleans_up_folder_on_keyboard_interrupt(
+        self,
+        mock_ui,
+        mock_setup_project_name,
+        mock_prompt_config,
+        tmp_path: Path,
+    ):
+        """Empty folder is removed when prompts are interrupted with Ctrl+C."""
+        from nao_core.commands.init import init
+
+        project_path = tmp_path / "interrupted-project"
+        project_path.mkdir()
+
+        mock_setup_project_name.return_value = ("interrupted-project", project_path, None, True)
+        mock_prompt_config.side_effect = KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            init()
+
+        assert not project_path.exists()
+
+    @patch("nao_core.commands.init.NaoConfig.promptConfig")
+    @patch("nao_core.commands.init.setup_project_name")
+    @patch("nao_core.commands.init.UI")
+    def test_init_cleans_up_folder_on_unexpected_error(
+        self,
+        mock_ui,
+        mock_setup_project_name,
+        mock_prompt_config,
+        tmp_path: Path,
+    ):
+        """Empty folder is removed when an unexpected exception aborts init."""
+        from nao_core.commands.init import init
+
+        project_path = tmp_path / "broken-project"
+        project_path.mkdir()
+
+        mock_setup_project_name.return_value = ("broken-project", project_path, None, True)
+        mock_prompt_config.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError):
+            init()
+
+        assert not project_path.exists()
+
+    @patch("nao_core.commands.init.NaoConfig.promptConfig")
+    @patch("nao_core.commands.init.setup_project_name")
+    @patch("nao_core.commands.init.UI")
+    def test_init_cleans_up_folder_on_init_error_after_creation(
+        self,
+        mock_ui,
+        mock_setup_project_name,
+        mock_prompt_config,
+        tmp_path: Path,
+    ):
+        """Empty folder is removed when an InitError is raised after creation."""
+        from nao_core.commands.init import init
+        from nao_core.config.exceptions import InitError
+
+        project_path = tmp_path / "init-error-project"
+        project_path.mkdir()
+
+        mock_setup_project_name.return_value = ("init-error-project", project_path, None, True)
+        mock_prompt_config.side_effect = InitError("config prompts failed")
+
+        with pytest.raises(SystemExit):
+            init()
+
+        assert not project_path.exists()
+
+    @patch("nao_core.commands.init.NaoConfig.promptConfig")
+    @patch("nao_core.commands.init.setup_project_name")
+    @patch("nao_core.commands.init.UI")
+    def test_init_preserves_existing_folder_on_abort(
+        self,
+        mock_ui,
+        mock_setup_project_name,
+        mock_prompt_config,
+        tmp_path: Path,
+    ):
+        """A pre-existing folder (force=True / reinit) is not deleted on abort."""
+        from nao_core.commands.init import init
+
+        project_path = tmp_path / "preexisting-project"
+        project_path.mkdir()
+        sentinel_file = project_path / "keep-me.txt"
+        sentinel_file.write_text("important user data")
+
+        mock_setup_project_name.return_value = (
+            "preexisting-project",
+            project_path,
+            None,
+            False,
+        )
+        mock_prompt_config.side_effect = KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            init()
+
+        assert project_path.exists()
+        assert sentinel_file.read_text() == "important user data"
+
+    @patch("nao_core.commands.init.NaoConfig.promptConfig")
+    @patch("nao_core.commands.init.setup_project_name")
+    @patch("nao_core.commands.init.UI")
+    def test_init_does_not_clean_up_after_structure_created(
+        self,
+        mock_ui,
+        mock_setup_project_name,
+        mock_prompt_config,
+        tmp_path: Path,
+    ):
+        """Folder is preserved when failure happens after create_empty_structure.
+
+        Anything that fails post-setup (e.g. dep install, debug) must not blow
+        away a successfully initialized project.
+        """
+        from nao_core.commands.init import init
+        from nao_core.config import NaoConfig
+
+        project_path = tmp_path / "done-project"
+        project_path.mkdir()
+
+        mock_setup_project_name.return_value = ("done-project", project_path, None, True)
+        mock_prompt_config.return_value = NaoConfig(
+            project_name="done-project",
+            databases=[],
+            repos=[],
+            llm=None,
+            slack=None,
+        )
+
+        with patch("nao_core.deps.get_missing_extras", side_effect=RuntimeError("late failure")):
+            with pytest.raises(RuntimeError):
+                init()
+
+        assert project_path.exists()
+        assert (project_path / "nao_config.yaml").exists()
+        assert (project_path / "databases").exists()
+
 
 class TestSetupProjectNameNoTty:
     """Tests for setup_project_name in non-interactive (no_tty) mode."""
@@ -643,11 +789,12 @@ class TestSetupProjectNameNoTty:
         project_dir.mkdir()
         monkeypatch.chdir(project_dir)
 
-        name, path, existing = setup_project_name(no_tty=True)
+        name, path, existing, created = setup_project_name(no_tty=True)
 
         assert name == "my-agent-project"
         assert path == project_dir
         assert existing is None
+        assert created is False
         mock_ask_text.assert_not_called()
 
     @patch("nao_core.commands.init.ask_text")
@@ -655,12 +802,13 @@ class TestSetupProjectNameNoTty:
         """In no-tty mode with --name, creates a subfolder for the project."""
         monkeypatch.chdir(tmp_path)
 
-        name, path, existing = setup_project_name(no_tty=True, name="explicit-name")
+        name, path, existing, created = setup_project_name(no_tty=True, name="explicit-name")
 
         assert name == "explicit-name"
         assert path == Path("explicit-name")
         assert path.exists()
         assert existing is None
+        assert created is True
         mock_ask_text.assert_not_called()
 
     @patch("nao_core.commands.init.ask_confirm")
@@ -676,11 +824,12 @@ class TestSetupProjectNameNoTty:
         mock_config.project_name = "existing"
         mock_try_load.return_value = mock_config
 
-        name, path, existing = setup_project_name(no_tty=True)
+        name, path, existing, created = setup_project_name(no_tty=True)
 
         assert name == "existing"
         assert path == tmp_path
         assert existing == mock_config
+        assert created is False
         mock_confirm.assert_not_called()
 
     @patch("nao_core.commands.init.ask_text")
@@ -688,12 +837,13 @@ class TestSetupProjectNameNoTty:
         """Passing --name without --yes still skips the project name prompt."""
         monkeypatch.chdir(tmp_path)
 
-        name, path, existing = setup_project_name(name="cli-named-project")
+        name, path, existing, created = setup_project_name(name="cli-named-project")
 
         assert name == "cli-named-project"
         assert path == Path("cli-named-project")
         assert path.exists()
         assert existing is None
+        assert created is True
         mock_ask_text.assert_not_called()
 
 

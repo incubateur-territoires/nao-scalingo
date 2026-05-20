@@ -1,4 +1,5 @@
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
@@ -36,8 +37,12 @@ def setup_project_name(
     force: bool = False,
     name: str | None = None,
     no_tty: bool = False,
-) -> tuple[str, Path, NaoConfig | None]:
-    """Setup the project name. Returns existing config if found and user wants to extend.
+) -> tuple[str, Path, NaoConfig | None, bool]:
+    """Setup the project name.
+
+    Returns a 4-tuple ``(project_name, project_path, existing_config, created_folder)``
+    where ``created_folder`` is ``True`` when the project folder was freshly created
+    by this call (and is therefore safe to remove if `nao init` aborts later on).
 
     In non-interactive (no_tty) mode:
     - If a `nao_config.yaml` exists in the current directory, the existing config is reused
@@ -63,7 +68,7 @@ def setup_project_name(
         UI.print(f"[dim]Project: {existing_config.project_name}[/dim]\n")
 
         if force or no_tty or ask_confirm("Update this project configuration?", default=True):
-            return existing_config.project_name, current_dir, existing_config
+            return existing_config.project_name, current_dir, existing_config, False
 
         raise InitError("Initialization cancelled.")
 
@@ -79,16 +84,17 @@ def setup_project_name(
 
     if no_tty and not name:
         # Initialize in the current directory when no explicit name is given
-        return project_name, current_dir, None
+        return project_name, current_dir, None, False
 
     project_path = Path(project_name)
+    folder_existed_before = project_path.exists()
 
-    if project_path.exists() and not force:
+    if folder_existed_before and not force:
         raise ProjectExistsError(project_name)
 
     project_path.mkdir(parents=True, exist_ok=True)
 
-    return project_name, project_path, None
+    return project_name, project_path, None, not folder_existed_before
 
 
 def create_empty_structure(project_path: Path) -> tuple[list[str], list[CreatedFile]]:
@@ -134,6 +140,19 @@ def create_empty_structure(project_path: Path) -> tuple[list[str], list[CreatedF
         created_files.append(file)
 
     return created_folders, created_files
+
+
+def _cleanup_partial_project(project_path: Path) -> None:
+    """Remove a freshly-created project folder after an aborted init.
+
+    Failures are swallowed so the original error is not masked, but a warning
+    is surfaced so the user knows whether they need to remove the folder by hand.
+    """
+    try:
+        shutil.rmtree(project_path)
+        UI.info(f"Removed incomplete project folder [dim]{project_path}[/dim].")
+    except Exception as cleanup_error:
+        UI.warn(f"Could not remove incomplete project folder [dim]{project_path}[/dim]: {cleanup_error}")
 
 
 def _install_with_progress(extras: list[str]) -> bool:
@@ -197,8 +216,14 @@ def init(
     """
     UI.info("\n🚀 nao project initialization\n")
 
+    project_path: Path | None = None
+    cleanup_on_abort = False
+
     try:
-        project_name, project_path, existing_config = setup_project_name(force=force, name=name, no_tty=yes)
+        project_name, project_path, existing_config, created_folder = setup_project_name(
+            force=force, name=name, no_tty=yes
+        )
+        cleanup_on_abort = created_folder
 
         if yes:
             config = _build_no_tty_config(project_name, existing_config)
@@ -207,8 +232,9 @@ def init(
 
         config.save(project_path)
 
-        # Create project folder structure
         created_folders, created_files = create_empty_structure(project_path)
+
+        cleanup_on_abort = False
 
         UI.print()
         if existing_config:
@@ -273,5 +299,15 @@ def init(
         UI.print()
 
     except InitError as e:
+        if cleanup_on_abort and project_path is not None:
+            _cleanup_partial_project(project_path)
         UI.error(str(e))
         raise SystemExit(1) from e
+    except KeyboardInterrupt:
+        if cleanup_on_abort and project_path is not None:
+            _cleanup_partial_project(project_path)
+        raise
+    except Exception:
+        if cleanup_on_abort and project_path is not None:
+            _cleanup_partial_project(project_path)
+        raise
