@@ -136,7 +136,9 @@ class SnowflakeConfig(DatabaseConfig):
         default=None,
         description="Programmatic Access Token (PAT) value — use with authenticator='programmatic_access_token'",
     )
-    authenticator: Literal["externalbrowser", "username_password_mfa", "jwt_token", "oauth", "programmatic_access_token"] | None = Field(
+    authenticator: (
+        Literal["externalbrowser", "username_password_mfa", "jwt_token", "oauth", "programmatic_access_token"] | None
+    ) = Field(
         default=None,
         description="Authentication method (e.g., 'externalbrowser' for SSO, 'programmatic_access_token' for PAT)",
     )
