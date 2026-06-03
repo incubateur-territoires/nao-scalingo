@@ -1,17 +1,7 @@
-# Paquets système installés par l'apt-buildpack (dispo au build ET au runtime).
-# Runtime (cf. stage 5 du Dockerfile amont) :
 ca-certificates
-chromium
 curl
-fontconfig
-fonts-dejavu-core
 git
-libpq5
 openssh-client
-unixodbc
-# Build des deps Python natives (cf. stage python-builder du Dockerfile amont) :
+libpq5
+libpq-dev
 build-essential
-gcc
-pkg-config
-unixodbc-dev
-libmariadb-dev

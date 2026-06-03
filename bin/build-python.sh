@@ -22,5 +22,10 @@ if [ -n "${NAO_CLI_VERSION:-}" ]; then
   sed -i -E "s/^version = .*/version = \"${NAO_CLI_VERSION}\"/" pyproject.toml || true
 fi
 
-# Installe dans l'interpréteur exact du buildpack (= celui utilisé au runtime), sans ambiguïté de venv.
-uv pip install --python "$PY" '.[all]'
+# Install only the backends actually needed (keeps the slug under Scalingo's 2 GiB limit).
+# Override per product via NAO_CLI_EXTRAS, e.g. "postgres,bigquery,anthropic".
+# '.[all]' pulls every DB connector (snowflake, databricks, bigquery, mssql…) and blows up the slug.
+EXTRAS="${NAO_CLI_EXTRAS:-postgres,anthropic,mistral,openai}"
+echo "[build-python] installing nao-core extras: $EXTRAS"
+# Target the exact interpreter provisioned by the buildpack (= the runtime one), no venv ambiguity.
+uv pip install --python "$PY" ".[${EXTRAS}]"
