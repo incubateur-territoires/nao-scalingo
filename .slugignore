@@ -1,0 +1,8 @@
+# Allège le slug (limite Scalingo : 2 GiB). On retire ce qui n'est pas utile au runtime.
+.github
+.husky
+.vscode
+docker
+nginx
+docs
+**/*.test.ts

@@ -1,0 +1,4 @@
+# Présent uniquement pour que le python-buildpack Scalingo détecte un projet Python
+# et provisionne Python 3.12 + uv. L'installation réelle du CLI nao (cli/.[all])
+# est faite par bin/build-python.sh avec uv. Ne PAS y lister les deps du CLI.
+uv

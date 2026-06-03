@@ -1,0 +1,27 @@
+{
+  "name": "nao",
+  "description": "nao — agent analytics open source (1 instance par produit, données isolées)",
+  "repository": "https://github.com/incubateur-territoires/nao-scalingo",
+  "env": {
+    "MODE": { "value": "prod" },
+    "NODE_ENV": { "value": "production" },
+    "HUSKY": { "value": "0", "description": "Désactive le hook husky pendant le build" },
+    "FASTAPI_PORT": { "value": "8005", "description": "Port interne du sidecar FastAPI (localhost)" },
+    "NAO_CONTEXT_SOURCE": { "value": "git" },
+    "NAO_CONTEXT_GIT_URL": { "required": true, "description": "Repo de contexte du produit (public de préférence)" },
+    "NAO_CONTEXT_GIT_BRANCH": { "value": "main" },
+    "NAO_CONTEXT_GIT_SUBPATH": { "required": false, "description": "Sous-dossier du repo (monorepo de contexte)" },
+    "NAO_CONTEXT_GIT_TOKEN": { "required": false, "description": "PAT si le repo de contexte est privé (HTTPS)" },
+    "BETTER_AUTH_SECRET": { "generator": "secret", "description": "Secret de session — doit rester stable" },
+    "BETTER_AUTH_URL": { "required": true, "description": "URL publique de l'app (https://<app>.osc-secnum-fr1.scalingo.io)" },
+    "ANTHROPIC_API_KEY": { "required": false, "description": "Clé LLM du produit (Anthropic) — ou MISTRAL_API_KEY/OPENAI_API_KEY" },
+    "MISTRAL_API_KEY": { "required": false },
+    "OPENAI_API_KEY": { "required": false }
+  },
+  "addons": [
+    "postgresql:postgresql-starter-512"
+  ],
+  "formation": {
+    "web": { "amount": 1, "size": "M" }
+  }
+}
