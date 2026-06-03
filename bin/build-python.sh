@@ -28,4 +28,5 @@ fi
 EXTRAS="${NAO_CLI_EXTRAS:-postgres,anthropic,mistral,openai}"
 echo "[build-python] installing nao-core extras: $EXTRAS"
 # Target the exact interpreter provisioned by the buildpack (= the runtime one), no venv ambiguity.
-uv pip install --python "$PY" ".[${EXTRAS}]"
+# --no-cache: don't write uv's wheel cache into the slug (it would otherwise ship in the image).
+uv pip install --no-cache --python "$PY" ".[${EXTRAS}]"
