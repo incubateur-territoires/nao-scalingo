@@ -3,5 +3,3 @@ curl
 git
 openssh-client
 libpq5
-libpq-dev
-build-essential
