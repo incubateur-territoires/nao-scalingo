@@ -1,7 +1,3 @@
-# Multi-buildpack Scalingo pour nao (ordre important : le DERNIER fixe la commande de start).
-# 1. apt   : paquets système (git, chromium, libpq, openssh…) — cf. Aptfile
-# 2. python: fournit Python 3.12 + pip (uv installé via requirements.txt) pour le sidecar FastAPI
-# 3. bun   : fournit bun (runtime backend) + lit le Procfile pour démarrer le process web
 https://github.com/Scalingo/apt-buildpack.git
 https://github.com/Scalingo/python-buildpack.git
 https://github.com/incubateur-territoires/scalingo-buildpack-bun
