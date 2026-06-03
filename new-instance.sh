@@ -38,33 +38,38 @@ LLM_KEY=""
 sc() { scalingo --region "$REGION" --app "$APP" "$@"; }
 
 echo "=== 1/5 Création de l'app $APP ($REGION) ==="
-scalingo --region "$REGION" create "$APP"
+scalingo --region "$REGION" create "$APP" || echo "ℹ app déjà créée, on continue"
 
 echo "=== 2/5 Addon PostgreSQL ($PG_PLAN) ==="
-sc addons-add postgresql "$PG_PLAN"
+sc addons-add postgresql "$PG_PLAN" || echo "ℹ addon déjà présent, on continue"
 
 echo "=== 3/5 Variables d'environnement ==="
 # DB_URI n'est PAS défini : bin/web.sh le dérive de SCALINGO_POSTGRESQL_URL (auto-roté par l'addon).
-# shellcheck disable=SC2086
-sc env-set \
-  MODE=prod \
-  NODE_ENV=production \
-  HUSKY=0 \
-  FASTAPI_PORT=8005 \
-  NAO_CONTEXT_SOURCE=git \
-  NAO_CONTEXT_GIT_URL="$NAO_CONTEXT_GIT_URL" \
-  NAO_CONTEXT_GIT_BRANCH="${NAO_CONTEXT_GIT_BRANCH:-main}" \
-  NAO_CONTEXT_GIT_SUBPATH="${NAO_CONTEXT_GIT_SUBPATH:-}" \
-  NAO_CONTEXT_GIT_TOKEN="${NAO_CONTEXT_GIT_TOKEN:-}" \
-  BETTER_AUTH_SECRET="$(openssl rand -hex 32)" \
-  BETTER_AUTH_URL="https://${APP}.${REGION}.scalingo.io" \
-  $LLM_KEY
+# On ne passe QUE les variables non vides (scalingo env-set refuse VAR=).
+ENV_ARGS=(
+  MODE=prod
+  NODE_ENV=production
+  HUSKY=0
+  FASTAPI_PORT=8005
+  NAO_CONTEXT_SOURCE=git
+  "NAO_CONTEXT_GIT_URL=$NAO_CONTEXT_GIT_URL"
+  "NAO_CONTEXT_GIT_BRANCH=${NAO_CONTEXT_GIT_BRANCH:-main}"
+  "BETTER_AUTH_SECRET=$(openssl rand -hex 32)"
+  "BETTER_AUTH_URL=https://${APP}.${REGION}.scalingo.io"
+)
+[ -n "${NAO_CONTEXT_GIT_SUBPATH:-}" ] && ENV_ARGS+=("NAO_CONTEXT_GIT_SUBPATH=$NAO_CONTEXT_GIT_SUBPATH")
+[ -n "${NAO_CONTEXT_GIT_TOKEN:-}" ]   && ENV_ARGS+=("NAO_CONTEXT_GIT_TOKEN=$NAO_CONTEXT_GIT_TOKEN")
+[ -n "${ANTHROPIC_API_KEY:-}" ]       && ENV_ARGS+=("ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+[ -n "${MISTRAL_API_KEY:-}" ]         && ENV_ARGS+=("MISTRAL_API_KEY=$MISTRAL_API_KEY")
+[ -n "${OPENAI_API_KEY:-}" ]          && ENV_ARGS+=("OPENAI_API_KEY=$OPENAI_API_KEY")
+sc env-set "${ENV_ARGS[@]}"
 
-echo "=== 4/5 Remote git Scalingo ==="
-sc git-setup --remote "scalingo-${APP}"
-
-echo "=== 5/5 Déploiement (push de la branche courante) ==="
-git push "scalingo-${APP}" HEAD:master
+echo "=== 4/4 Déploiement (archive du HEAD via l'API, sans clé SSH) ==="
+SHA="$(git rev-parse --short HEAD)"
+ARCHIVE="${TMPDIR:-/tmp}/${APP}-${SHA}.tar.gz"
+git archive --format=tar.gz -o "$ARCHIVE" HEAD
+sc deploy "$ARCHIVE" "$SHA"
+rm -f "$ARCHIVE"
 
 echo
 echo "✓ Instance déployée : https://${APP}.${REGION}.scalingo.io"

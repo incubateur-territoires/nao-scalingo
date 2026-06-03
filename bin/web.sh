@@ -11,8 +11,30 @@ export FASTAPI_PORT="${FASTAPI_PORT:-8005}"     # interne (127.0.0.1), défaut d
 export MODE="${MODE:-prod}"
 export NODE_ENV="${NODE_ENV:-production}"
 
-# --- Base de données : l'URL de l'addon (auto-rotée) prime ; fallback DB_URI explicite. ---
+# --- Base interne de nao (sessions, chats…) : l'URL de l'addon (auto-rotée) prime. ---
 export DB_URI="${SCALINGO_POSTGRESQL_URL:-${DB_URI:-${DATABASE_URL:-sqlite:./db.sqlite}}}"
+
+# --- Base SOURCE analysée (référencée par nao_config.yaml). Ergonomie « connection string » :
+#     fournis un seul NAO_DB_URL=postgres://user:pass@host:port/db et on le décompose en
+#     NAO_DB_HOST/PORT/NAME/USER/PASSWORD. Les variables explicites éventuelles priment. ---
+if [ -n "${NAO_DB_URL:-}" ] && command -v python3 >/dev/null 2>&1; then
+  eval "$(python3 - "$NAO_DB_URL" <<'PY'
+import sys, shlex
+from urllib.parse import urlparse, unquote
+p = urlparse(sys.argv[1])
+vals = {
+    "NAO_DB_HOST": p.hostname or "",
+    "NAO_DB_PORT": str(p.port or 5432),
+    "NAO_DB_NAME": (p.path or "").lstrip("/"),
+    "NAO_DB_USER": unquote(p.username or ""),
+    "NAO_DB_PASSWORD": unquote(p.password or ""),
+}
+for k, v in vals.items():
+    # ${VAR:-default} : une valeur déjà exportée n'est pas écrasée.
+    print(f"export {k}=${{{k}:-{shlex.quote(v)}}}")
+PY
+)"
+fi
 
 # --- Contexte git (repo de contexte du produit). Logique reprise de docker/entrypoint.sh. ---
 if [ "${NAO_CONTEXT_SOURCE:-}" = "git" ] || [ -n "${NAO_CONTEXT_GIT_URL:-}" ]; then
