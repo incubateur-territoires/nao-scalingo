@@ -4,4 +4,4 @@
 # 3. bun   : fournit bun (runtime backend) + lit le Procfile pour démarrer le process web
 https://github.com/Scalingo/apt-buildpack.git
 https://github.com/Scalingo/python-buildpack.git
-https://github.com/kilterset/heroku-bun-buildpack
+# https://github.com/incubateur-territoires/scalingo-buildpack-bun
