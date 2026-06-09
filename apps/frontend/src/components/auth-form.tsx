@@ -1,11 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
+
 import { trpc } from '../main';
 import { MicrosoftSignInButton, useIsMicrosoftSetup } from '@/components/auth-microsoft-button';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
 import GithubIcon from '@/components/icons/github-icon.svg';
 import GoogleIcon from '@/components/icons/google-icon.svg';
 import NaoLogo from '@/components/icons/nao-full-logo.svg';
+import { OidcSignInButton } from '@/components/auth-oidc-button';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { brandingAssetUrl, useBranding } from '@/hooks/use-branding';
 import { handleGithubSignIn, handleGoogleSignIn } from '@/lib/auth-client';
 
@@ -37,9 +39,10 @@ export function AuthForm({
 	const isGoogleSetup = useQuery(trpc.authConfig.google.isSetup.queryOptions());
 	const isGithubSetup = useQuery(trpc.authConfig.github.isSetup.queryOptions());
 	const isMicrosoftSetup = useIsMicrosoftSetup();
+	const oidcConfig = useQuery(trpc.authConfig.oidc.getConfig.queryOptions());
 	const branding = useBranding();
 
-	const hasAnyProvider = isGoogleSetup.data || isGithubSetup.data || isMicrosoftSetup;
+	const hasAnyProvider = isGoogleSetup.data || isGithubSetup.data || isMicrosoftSetup || oidcConfig.data;
 
 	return (
 		<div className='mx-auto w-full max-w-md p-8 my-auto'>
@@ -83,6 +86,13 @@ export function AuthForm({
 							</Button>
 						)}
 						{isMicrosoftSetup && <MicrosoftSignInButton callbackUrl={socialCallbackUrl} />}
+						{oidcConfig.data && (
+							<OidcSignInButton
+								providerId={oidcConfig.data.providerId}
+								providerName={oidcConfig.data.providerName}
+								callbackUrl={socialCallbackUrl}
+							/>
+						)}
 					</div>
 
 					{displayEmailPasswordForm && (
