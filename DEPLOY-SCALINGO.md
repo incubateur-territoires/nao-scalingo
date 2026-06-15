@@ -31,7 +31,8 @@ séparer imposerait de patcher le code amont (`execute-sql.ts`, `live-story.ts`)
 | `bin/web.sh` | clone du contexte git + sidecar + backend sur `$PORT` |
 | `bin/release.sh` | migrations Drizzle (gating déploiement) |
 | `scalingo.json` | manifeste addons + env (review apps / one-click) |
-| `new-instance.sh` | provisionne + déploie une instance produit |
+| `nao-scalingo.sh` | gère une instance : create / deploy / logs / env / scale / destroy… |
+| `instances/<produit>/` | (optionnel) fichiers qui écrasent la base pour une instance (ex. `Procfile`) |
 | `package.json` | ajout du script `heroku-postbuild` (seule modif d'un fichier amont) |
 
 ## Pré-requis
@@ -40,19 +41,70 @@ séparer imposerait de patcher le code amont (`execute-sql.ts`, `live-story.ts`)
 2. **Accès région `osc-secnum-fr1`** (SecNumCloud) activé par le support Scalingo (entité EU requise).
 3. Le repo de déploiement (ce fork) poussé sur GitHub (`incubateur-territoires/nao-scalingo`).
 
-## Créer une nouvelle instance
+## Gérer les instances : `nao-scalingo.sh`
+
+Toutes les opérations passent par `./nao-scalingo.sh <commande> <produit>` (voir `./nao-scalingo.sh help`).
+
+**Créer une instance** (provisionne app + PostgreSQL + env + 1er déploiement) :
 
 ```bash
 NAO_CONTEXT_GIT_URL=https://github.com/incubateur-territoires/contexte-<produit>.git \
 ANTHROPIC_API_KEY=sk-ant-... \
-./new-instance.sh <produit>
+./nao-scalingo.sh create <produit>
 ```
-
-Cela crée l'app `nao-<produit>`, l'addon PostgreSQL, les variables d'env, puis déploie la branche courante.
 
 Variables reconnues : `NAO_CONTEXT_GIT_URL` (requis), `ANTHROPIC_API_KEY`/`MISTRAL_API_KEY`/`OPENAI_API_KEY`,
 `NAO_CONTEXT_GIT_BRANCH`, `NAO_CONTEXT_GIT_SUBPATH`, `NAO_CONTEXT_GIT_TOKEN` (repo privé),
+`DB_URI` (DB externe → implique `--no-pg`),
 `SCALINGO_REGION` (déf. `osc-secnum-fr1`), `PG_PLAN`, `WEB_SIZE`.
+
+`create` est **idempotent** : Scalingo est la source de vérité des variables d'env, donc relancer
+`create <produit>` relit les valeurs déjà posées (inutile de repasser `NAO_CONTEXT_GIT_URL`) et ne
+**régénère jamais** `BETTER_AUTH_SECRET`.
+
+**Opérations courantes :**
+
+```bash
+./nao-scalingo.sh deploy <produit>        # redéploie le HEAD courant (ne touche PAS à l'env)
+./nao-scalingo.sh logs <produit>          # suit les logs
+./nao-scalingo.sh set-key <produit>       # pose ANTHROPIC_API_KEY=... lu dans l'env
+./nao-scalingo.sh set-env <produit> K=V   # définit une variable d'env
+./nao-scalingo.sh restart <produit>
+./nao-scalingo.sh scale <produit> XL
+./nao-scalingo.sh destroy <produit>       # détruit l'app + base (confirmation)
+```
+
+### Customiser une instance (overlay)
+
+Pour personnaliser une seule instance sans toucher la base commune, dépose des fichiers dans
+`instances/<produit>/` : au déploiement, ils **écrasent** les fichiers de la racine (Procfile,
+Aptfile, `.buildpacks`, `bin/`…).
+
+**Exemple — base SOURCE derrière un bastion SSH via un tunnel** (cf. `instances/inclusion-numerique-prod/`) :
+
+- `instances/<produit>/.buildpacks` ajoute le **ssh-private-key-buildpack** Scalingo en **premier** :
+
+  ```
+  https://github.com/Scalingo/ssh-private-key-buildpack.git
+  https://github.com/Scalingo/apt-buildpack.git
+  https://github.com/Scalingo/python-buildpack.git
+  https://github.com/incubateur-territoires/scalingo-buildpack-bun
+  ```
+
+- `instances/<produit>/Procfile` ouvre le tunnel avant le serveur (le buildpack a installé la clé
+  dans `~/.ssh`, donc pas de `-i`) :
+
+  ```
+  release: bash bin/release.sh
+  web:     ssh -N -f -L $DS_BDD_IP $DS_BASTION_IP -p $DS_BASTION_PORT && bash bin/web.sh
+  ```
+
+Les **secrets restent en variables d'env Scalingo** (`./nao-scalingo.sh set-env <produit> ...`) :
+`SSH_KEY` (clé privée **en base64**, lue par le buildpack), `SSH_HOSTS` (hôtes ajoutés à
+`known_hosts`, dont le bastion), `DS_BDD_IP` (spec `-L`, ex. `5432:<hote-db>:5432`), `DS_BASTION_IP`
+(`<user>@<bastion>`), `DS_BASTION_PORT`, et `NAO_DB_URL=postgres://…@127.0.0.1:<port_local>/…`
+(la base source vue à travers le tunnel). La base **interne** de nao reste l'addon PostgreSQL
+Scalingo (`DB_URI` auto-dérivé) — on **garde** l'addon (pas de `--no-pg`).
 
 ## Variables d'environnement clés
 

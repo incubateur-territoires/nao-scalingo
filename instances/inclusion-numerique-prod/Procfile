@@ -1,0 +1,15 @@
+# Overlay nao-inclusion-numerique-prod : la base SOURCE analysée n'est joignable qu'à travers un
+# bastion SSH. La clé est installée dans ~/.ssh par le ssh-private-key-buildpack (cf. .buildpacks
+# d'overlay + variables SSH_KEY / SSH_HOSTS), donc `ssh` n'a pas besoin de -i.
+#
+# Variables d'env (posées sur Scalingo, copiées de l'app qui marche) :
+#   DS_BDD_IP       spec de forwarding -L, ex. 5432:<hote-db>:5432
+#   DS_BASTION_IP   destination ssh, ex. <user>@<bastion>
+#   DS_BASTION_PORT port SSH du bastion
+#   SSH_KEY         clé privée (base64) — lue par le buildpack
+#   SSH_HOSTS       hôtes à ajouter à known_hosts (dont le bastion)
+#
+# La base INTERNE de nao (sessions/chats) reste l'addon PostgreSQL Scalingo → release inchangé.
+# La base SOURCE passe par le tunnel → pointe NAO_DB_URL sur 127.0.0.1:<port_local>.
+release: bash bin/release.sh
+web:     ssh -N -f -L $DS_BDD_IP $DS_BASTION_IP -p $DS_BASTION_PORT && bash bin/web.sh
