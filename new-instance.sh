@@ -25,7 +25,7 @@ PRODUCT="${1:?usage: ./new-instance.sh <produit>}"
 APP="nao-${PRODUCT}"
 REGION="${SCALINGO_REGION:-osc-secnum-fr1}"
 PG_PLAN="${PG_PLAN:-postgresql-starter-512}"
-WEB_SIZE="${WEB_SIZE:-M}"
+WEB_SIZE="${WEB_SIZE:-L}"
 : "${NAO_CONTEXT_GIT_URL:?définis NAO_CONTEXT_GIT_URL (repo de contexte du produit)}"
 
 # Clé(s) LLM optionnelles : peuvent aussi être configurées via l'interface de Nao (stockées en base).
