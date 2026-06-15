@@ -28,6 +28,16 @@ ASSUME_YES="${ASSUME_YES:-0}"
 NO_PG=0
 ENV_ARGS=()
 
+# Temporaires de déploiement, nettoyés par cleanup() (trap EXIT).
+DEPLOY_TMP_ROOT=""
+DEPLOY_ARCHIVE=""
+cleanup() {
+  [ -n "${DEPLOY_TMP_ROOT:-}" ] && rm -rf "$DEPLOY_TMP_ROOT"
+  [ -n "${DEPLOY_ARCHIVE:-}" ]  && rm -f  "$DEPLOY_ARCHIVE"
+  return 0
+}
+trap cleanup EXIT
+
 # --- Couleurs (désactivées hors TTY ou si NO_COLOR) ---
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
   C_RESET=$'\033[0m'; C_INFO=$'\033[36m'; C_OK=$'\033[32m'
@@ -293,13 +303,14 @@ build_create_env() {
 # python-only). Cf. doc.scalingo.com/platform/deployment/deploy-from-archive.
 deploy_archive() {
   require_clean_head
-  local sha root appdir archive
+  local sha appdir
   sha="$(git rev-parse --short HEAD)"
-  root="$(mktemp -d "${TMPDIR:-/tmp}/${APP}.XXXXXX")"
-  archive="$(mktemp "${TMPDIR:-/tmp}/${APP}-${sha}.XXXXXX")"; archive="${archive}.tar.gz"
-  trap 'rm -rf "$root" "$archive"' RETURN
+  # Variables globales nettoyées par cleanup() (trap EXIT) — pas de trap RETURN sur des locales.
+  DEPLOY_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/${APP}.XXXXXX")"
+  DEPLOY_ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/${APP}-${sha}.XXXXXX")"
+  DEPLOY_ARCHIVE="${DEPLOY_ARCHIVE}.tar.gz"
 
-  appdir="$root/$APP"
+  appdir="$DEPLOY_TMP_ROOT/$APP"
   mkdir -p "$appdir"
   git archive HEAD | tar -x -C "$appdir"
 
@@ -309,8 +320,8 @@ deploy_archive() {
   fi
 
   step "Déploiement de $APP (HEAD=$sha)"
-  tar -czf "$archive" -C "$root" "$APP"
-  sc deploy "$archive" "$sha"
+  tar -czf "$DEPLOY_ARCHIVE" -C "$DEPLOY_TMP_ROOT" "$APP"
+  sc deploy "$DEPLOY_ARCHIVE" "$sha"
   ok "Déployé : https://${APP}.${REGION}.scalingo.io"
 }
 
