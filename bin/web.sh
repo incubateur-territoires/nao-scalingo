@@ -94,4 +94,12 @@ trap 'kill "$FASTAPI_PID" 2>/dev/null || true' EXIT
 ( while kill -0 "$FASTAPI_PID" 2>/dev/null; do sleep 5; done; echo "✗ FastAPI arrêté — arrêt du conteneur"; kill -TERM 0 ) &
 
 # --- Backend au premier plan, lié à $PORT (joue aussi les migrations au boot). ---
-exec bun run apps/backend/src/cli.ts serve --port "$SERVER_PORT"
+# Optimisation cold-start : si NAO_USE_BUNDLE=true et que le bundle existe, on lance le JS
+# pré-bundlé (démarrage bien plus rapide). Sinon, mode par défaut éprouvé (transpile à la volée).
+if [ "${NAO_USE_BUNDLE:-}" = "true" ] && [ -f apps/backend/dist/cli.js ]; then
+  echo "▶ backend: bundle pré-compilé (apps/backend/dist/cli.js)"
+  exec bun apps/backend/dist/cli.js serve --port "$SERVER_PORT"
+else
+  echo "▶ backend: transpile à la volée (apps/backend/src/cli.ts)"
+  exec bun run apps/backend/src/cli.ts serve --port "$SERVER_PORT"
+fi
