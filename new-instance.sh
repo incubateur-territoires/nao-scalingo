@@ -47,6 +47,9 @@ echo "=== 3/5 Variables d'environnement ==="
 # DB_URI n'est PAS défini : bin/web.sh le dérive de SCALINGO_POSTGRESQL_URL (auto-roté par l'addon).
 # On ne passe QUE les variables non vides (scalingo env-set refuse VAR=).
 ENV_ARGS=(
+  # Pas de BUILDPACK_URL : Scalingo lit .buildpacks nativement (apt → python → bun).
+  # L'ancien multi-buildpack.git est déprécié/incompatible. Si Scalingo n'auto-détecte
+  # que python (cache figé), purger : scalingo --app <app> deployment-cache-delete.
   MODE=prod
   NODE_ENV=production
   HUSKY=0
@@ -67,7 +70,10 @@ sc env-set "${ENV_ARGS[@]}"
 echo "=== 4/4 Déploiement (archive du HEAD via l'API, sans clé SSH) ==="
 SHA="$(git rev-parse --short HEAD)"
 ARCHIVE="${TMPDIR:-/tmp}/${APP}-${SHA}.tar.gz"
-git archive --format=tar.gz -o "$ARCHIVE" HEAD
+# --prefix obligatoire : Scalingo exige UN dossier racine unique dans l'archive.
+# Sans lui (archive à plat), .buildpacks n'est pas vu à la racine → mono-buildpack
+# python (cli/) au lieu du multi-buildpack. Cf. doc.scalingo.com/.../deploy-from-archive.
+git archive --format=tar.gz --prefix="${APP}/" -o "$ARCHIVE" HEAD
 sc deploy "$ARCHIVE" "$SHA"
 rm -f "$ARCHIVE"
 
