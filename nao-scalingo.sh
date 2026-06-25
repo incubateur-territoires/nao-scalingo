@@ -295,6 +295,10 @@ build_create_env() {
   [ -n "${ANTHROPIC_API_KEY:-}" ]       && ENV_ARGS+=("ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
   [ -n "${MISTRAL_API_KEY:-}" ]         && ENV_ARGS+=("MISTRAL_API_KEY=$MISTRAL_API_KEY")
   [ -n "${OPENAI_API_KEY:-}" ]          && ENV_ARGS+=("OPENAI_API_KEY=$OPENAI_API_KEY")
+
+  # La dernière ligne `[ -n ... ] && ...` peut renvoyer 1 (test faux) ; sous set -e
+  # cela ferait sortir le script à l'appel nu de la fonction. On force un retour 0.
+  return 0
 }
 
 # Archive le HEAD (+ overlay instance) et déploie. SEULE action de deploy/update.
