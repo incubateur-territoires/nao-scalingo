@@ -29,4 +29,28 @@ EXTRAS="${NAO_CLI_EXTRAS:-postgres,anthropic,mistral,openai}"
 echo "[build-python] installing nao-core extras: $EXTRAS"
 # Target the exact interpreter provisioned by the buildpack (= the runtime one), no venv ambiguity.
 # --no-cache: don't write uv's wheel cache into the slug (it would otherwise ship in the image).
-uv pip install --no-cache --python "$PY" ".[${EXTRAS}]"
+# packaging: imported by ibis.backends.postgres but declared by neither ibis nor nao-core. It used
+# to come in through pytest, which upstream moved out of the core deps; '.[all]' still pulls it
+# transitively, our trimmed extras don't.
+uv pip install --no-cache --python "$PY" ".[${EXTRAS}]" packaging
+
+# Fail the build (the running version stays up) rather than ship an instance that cannot query
+# its database: nao reports any ImportError of a backend as "driver missing", hiding the cause.
+"$PY" - "$EXTRAS" <<'PY'
+import importlib
+import sys
+
+from nao_core.deps import _EXTRAS
+
+failures = []
+for extra in sys.argv[1].split(","):
+    for module in _EXTRAS.get(extra, []):
+        try:
+            importlib.import_module(module)
+        except Exception as error:
+            failures.append(f"{extra}: {module} -> {type(error).__name__}: {error}")
+
+if failures:
+    sys.exit("[build-python] extras not importable:\n  " + "\n  ".join(failures))
+print("[build-python] all extras importable")
+PY
