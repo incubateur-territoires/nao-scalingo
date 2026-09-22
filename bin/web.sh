@@ -94,8 +94,11 @@ fi
 # --- Sidecar FastAPI en arrière-plan (127.0.0.1:$FASTAPI_PORT) — le backend l'appelle en localhost. ---
 # PYTHONPATH : main.py importe son voisin `api_models` comme module de premier niveau (amont c74cb43),
 # ce qui ne se résout pas quand il est chargé sous le nom apps.backend.fastapi.main.
+# --workers 1 : sinon uvicorn suit WEB_CONCURRENCY (posé par le python-buildpack, 4 en L) et chaque
+# worker charge pandas/ibis (~1 Go au total en L). L'amont en lance un seul ; et le PID surveillé
+# ci-dessous est alors le vrai serveur, pas un superviseur qui relance des workers en boucle.
 PYTHONPATH="$PWD/apps/backend/fastapi${PYTHONPATH:+:$PYTHONPATH}" \
-  python -m uvicorn apps.backend.fastapi.main:app --host 127.0.0.1 --port "$FASTAPI_PORT" &
+  python -m uvicorn apps.backend.fastapi.main:app --host 127.0.0.1 --port "$FASTAPI_PORT" --workers 1 &
 FASTAPI_PID=$!
 trap 'kill "$FASTAPI_PID" 2>/dev/null || true' EXIT
 # Si le sidecar meurt, on fait tomber tout le conteneur pour que Scalingo le redémarre proprement.
