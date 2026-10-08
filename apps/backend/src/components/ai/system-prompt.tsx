@@ -5,6 +5,7 @@ import type { SemanticLayerMode } from '@nao/shared/types';
 import type { InternalSkill } from '../../agents/skills';
 import { listInternalSkills } from '../../agents/skills';
 import { Block, Bold, Br, CodeBlock, Link, List, ListItem, Location, Span, Title } from '../../lib/markdown';
+import type { SandboxSecretDefinition } from '../../services/sandbox-secret.service';
 import type { Skill } from '../../services/skill';
 import { tokenCounter } from '../../services/token-counter';
 import type { UserMemory } from '../../types/memory';
@@ -14,6 +15,7 @@ import type { ConfiguredDatabase, ContextPresence } from '../../utils/nao-config
 import { groupBy } from '../../utils/utils';
 import { getDialectSqlQueryRules, getDialectToolCallRules } from './dialect-rules';
 import { NaoContextStructure } from './nao-context-structure';
+import { storyKitGuideItems } from './story-kit-guide';
 
 type Connection = {
 	type: string;
@@ -31,13 +33,14 @@ type SystemPromptProps = {
 	customCharts?: ChartPluginManifestEntry[];
 	/** Names of MCP servers the agent is allowed to call (tools discovered as on-disk specs). */
 	mcpServers?: string[];
+	/** Secrets the user made available to sandboxes as environment variables — names and purposes only, never values. */
+	sandboxSecrets?: SandboxSecretDefinition[];
 	/** How the run may use the project's semantic layer; null or undefined when the project has none. */
 	semanticLayerMode?: SemanticLayerMode | null;
 	templates?: string[];
 	repoNames?: string[];
 	contextPresence?: ContextPresence;
 	timezone?: string;
-	testMode?: boolean;
 	/** Names of the tools in the run's tool set — rules for surface-dependent tools (e.g. display_map) are only emitted when the tool is present. Omit to include every rule. */
 	toolNames?: string[];
 	options?: SystemPromptOptions;
@@ -45,8 +48,12 @@ type SystemPromptProps = {
 
 /** What the instance the run executes on can do, when a rule depends on it. */
 type SystemPromptOptions = {
+	/** False when permanent storage is turned off, so `/home` does not exist even though `write` may. */
+	savedFilesEnabled?: boolean;
 	/** False when the storage backend has no real filesystem (`s3`), so grep cannot look inside saved files. */
 	canGrepSavedFiles?: boolean;
+	/** True when the instance exposes source-based custom stories under `/stories`. */
+	customStoriesEnabled?: boolean;
 };
 
 export const MEMORY_TOKEN_LIMIT = 1000;
@@ -60,16 +67,16 @@ export function SystemPrompt({
 	internalSkills = listInternalSkills(),
 	customCharts = [],
 	mcpServers = [],
+	sandboxSecrets = [],
 	semanticLayerMode = null,
 	templates,
 	repoNames = [],
 	contextPresence,
 	timezone,
-	testMode,
 	toolNames,
 	options = {},
 }: SystemPromptProps) {
-	const { canGrepSavedFiles = true } = options;
+	const { canGrepSavedFiles = true, savedFilesEnabled = true, customStoriesEnabled = false } = options;
 	const hasTool = (name: string) => !toolNames || toolNames.includes(name);
 	const queryToolLabel = hasTool('execute_semantic_query') ? 'execute_sql or execute_semantic_query' : 'execute_sql';
 	const visibleMemories = getMemoriesInTokenRange(memories, MEMORY_TOKEN_LIMIT);
@@ -138,28 +145,44 @@ export function SystemPrompt({
 								: 'If you can execute a SQL query, use the execute_sql tool for it.'}
 						</ListItem>
 					),
-					!testMode && (
+					...(hasTool('clarification')
+						? [
+								<ListItem>
+									Use the <Bold>clarification</Bold> tool when the user's request is genuinely
+									ambiguous and proceeding would likely produce the wrong result (e.g. multiple
+									plausible tables, unclear time range, undefined metric). If you need to ask another
+									clarifying question after the user answers, call the <Bold>clarification</Bold> tool
+									again instead of asking in plain text, bullet lists, or examples.
+								</ListItem>,
+							]
+						: []),
+					hasTool('suggest_follow_ups') && (
 						<ListItem>
-							Use the <Bold>clarification</Bold> tool when the user's request is genuinely ambiguous and
-							proceeding would likely produce the wrong result (e.g. multiple plausible tables, unclear
-							time range, undefined metric). If you need to ask another clarifying question after the user
-							answers, call the <Bold>clarification</Bold> tool again instead of asking in plain text,
-							bullet lists, or examples.
+							Call <Bold>suggest_follow_ups</Bold> once, as the very last tool of your turn, after your
+							answer is complete. Right before calling it, close your visible reply with one short,
+							friendly sentence that points the user to the suggestions shown below your message (e.g.
+							"Pick one of the suggestions below to keep going, or ask me anything else."), so they know
+							they can click one to continue. That sentence must be part of your message to the user,
+							never a note to yourself or part of your thinking.
 						</ListItem>
 					),
 					...dialectToolCallRules,
 				]}
 			</List>
-			{hasTool('write') && (
+			{hasTool('write') && savedFilesEnabled && (
 				<PermanentStorageBlock
 					canGrepSavedFiles={canGrepSavedFiles}
 					canRunSandbox={hasTool('execute_sandboxed_code')}
 					canExecuteSql={hasTool('execute_sql')}
+					canReplace={hasTool('str_replace')}
 				/>
+			)}
+			{customStoriesEnabled && hasTool('story') && hasTool('write') && (
+				<CustomStoriesBlock canReplace={hasTool('str_replace')} />
 			)}
 			{hasTool('execute_sql') && (
 				<LocalDatabaseBlock
-					canSaveResults={hasTool('write')}
+					canSaveResults={hasTool('write') && savedFilesEnabled}
 					hasSemanticResults={hasTool('execute_semantic_query')}
 					warehouseSqlEnabled={semanticLayerMode !== 'exclusive'}
 				/>
@@ -337,6 +360,8 @@ export function SystemPrompt({
 
 				{mcpServers.length > 0 && <McpServersBlock servers={mcpServers} />}
 
+				{hasTool('execute_sandboxed_code') && <SandboxSecretsBlock secrets={sandboxSecrets} />}
+
 				{visibleMemories.length > 0 && <MemoryBlock memories={visibleMemories} />}
 			</Block>
 		</Block>
@@ -401,10 +426,12 @@ function PermanentStorageBlock({
 	canGrepSavedFiles,
 	canRunSandbox,
 	canExecuteSql,
+	canReplace,
 }: {
 	canGrepSavedFiles: boolean;
 	canRunSandbox: boolean;
 	canExecuteSql: boolean;
+	canReplace: boolean;
 }) {
 	return (
 		<Block>
@@ -430,8 +457,14 @@ function PermanentStorageBlock({
 				</ListItem>
 				<ListItem>
 					<Bold>/home</Bold> is the only writable place: use <Bold>write</Bold> when the user asks to keep,
-					export or update something, or when a result is clearly worth reusing later. Everything else in the
-					tree is read-only. Do not save intermediate work nobody asked for.
+					export or update something, or when a result is clearly worth reusing later.{' '}
+					{canReplace && (
+						<>
+							To change part of a file that already exists, use <Bold>str_replace</Bold> with the exact
+							snippet rather than sending the whole file to <Bold>write</Bold> again.{' '}
+						</>
+					)}
+					Everything else in the tree is read-only. Do not save intermediate work nobody asked for.
 					{canExecuteSql && (
 						<>
 							{' '}
@@ -482,6 +515,62 @@ function PermanentStorageBlock({
 					Never give the full path in plain text, users might get confused about it as it's not clickable
 					directly in the chat.
 				</ListItem>
+			</List>
+		</Block>
+	);
+}
+
+function CustomStoriesBlock({ canReplace }: { canReplace: boolean }) {
+	return (
+		<Block>
+			<Title level={2}>Custom Stories</Title>
+			<Span>
+				A story is either <Bold>classic</Bold> (markdown with chart/table blocks) or <Bold>custom</Bold>: a
+				React app under <Bold>/stories/&lt;id&gt;/</Bold>, edited with{' '}
+				{canReplace ? (
+					<>
+						<Bold>str_replace</Bold> (or <Bold>write</Bold> for a new file)
+					</>
+				) : (
+					<Bold>write</Bold>
+				)}{' '}
+				and made visible with <Bold>story</Bold> "publish". Pick the format before the first <Bold>story</Bold>{' '}
+				call; a request gets exactly one story, never a classic one alongside or as a draft of a custom one.
+			</Span>
+			<Span>Choose custom when any of these holds, even if the user never says "custom":</Span>
+			<List>
+				<ListItem>
+					They ask for a "custom story" or an "app" — "custom" names the format, not a tailored classic story.
+				</ListItem>
+				<ListItem>
+					The deliverable has its own shape: slides, deck, presentation, pitch, one-pager, infographic,
+					wallboard/TV screen, scrollytelling narrative. Classic tabs are not slides.
+				</ListItem>
+				<ListItem>
+					It needs interaction beyond reading: what-if sliders or inputs, calculator or simulator,
+					click-to-drill or cross-filtering between charts, toggles between metrics or views, a step-by-step
+					walkthrough.
+				</ListItem>
+				<ListItem>
+					It needs a visual the chart types lack (funnel, cohort heatmap, gauge, timeline, calendar, flow) or
+					a bespoke layout, or the user found a classic story too limited.
+				</ListItem>
+			</List>
+			<Span>
+				Otherwise — a report or dashboard of charts, tables and text, tabs and grids included — use classic.
+			</Span>
+			<List>
+				{[
+					<ListItem key='workflow'>
+						Run the queries first, then "create" with format "custom" and no files to get a starter app;
+						read it, replace every <Bold>REPLACE_ME</Bold> queryId with a real query id and every
+						placeholder title with one that fits the data, keep its page/grid layout. On build_errors
+						nothing was published: fix and publish again. "update"/"replace" do not apply; "delete_files"
+						removes draft files and "revert" resets the draft to a published version. Published versions are
+						readable, not writable, at /stories/&lt;id&gt;/@v&lt;N&gt;/&lt;path&gt;.
+					</ListItem>,
+					...storyKitGuideItems(),
+				]}
 			</List>
 		</Block>
 	);
@@ -689,6 +778,42 @@ function McpServersBlock({ servers }: { servers: string[] }) {
 					<ListItem key={server}>{server}</ListItem>
 				))}
 			</List>
+		</Block>
+	);
+}
+
+function SandboxSecretsBlock({ secrets }: { secrets: SandboxSecretDefinition[] }) {
+	return (
+		<Block>
+			<Title level={2}>Sandbox Secrets</Title>
+			{secrets.length === 0 ? (
+				<Span>
+					The user has not defined any secret for sandboxes. When code needs an API key or another credential,
+					do not ask the user to paste it in the chat: tell them to add it under{' '}
+					<Bold>Settings → Project → Agent → Capabilities → Sandbox secrets</Bold>, after which it becomes an
+					environment variable inside execute_sandboxed_code.
+				</Span>
+			) : (
+				<>
+					<Span>
+						The user has defined the secrets below. Each one is set as an environment variable of the same
+						name inside <Bold>execute_sandboxed_code</Bold>, and only there: read it with{' '}
+						<Bold>os.environ["NAME"]</Bold> in Python or <Bold>$NAME</Bold> in a shell. You never see their
+						values, and any value that appears in the sandbox output is replaced with{' '}
+						<Bold>{'[REDACTED:NAME]'}</Bold> before it reaches you, so do not print, log or write them to
+						files and never ask the user to paste a secret in the chat. If a credential is missing, tell the
+						user to add it under <Bold>Settings → Project → Agent → Capabilities → Sandbox secrets</Bold>.
+					</Span>
+					<List>
+						{secrets.map((secret) => (
+							<ListItem key={secret.name}>
+								<Bold>{secret.name}</Bold>
+								{secret.description ? ` — ${secret.description}` : ''}
+							</ListItem>
+						))}
+					</List>
+				</>
+			)}
 		</Block>
 	);
 }

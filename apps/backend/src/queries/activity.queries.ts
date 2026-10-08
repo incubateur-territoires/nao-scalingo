@@ -176,10 +176,7 @@ export const linkStoryScheduledJob = async (storyId: string, scheduledJobId: str
 	await db.update(s.story).set({ scheduledJobId }).where(eq(s.story.id, storyId)).execute();
 };
 
-export type StoryOpenLink =
-	| { to: '/stories/preview/$chatId/$storySlug'; params: { chatId: string; storySlug: string } }
-	| { to: '/stories/shared/$shareId'; params: { shareId: string } }
-	| { to: '/stories/standalone/$storyId'; params: { storyId: string } };
+export type StoryOpenLink = { to: '/stories/$storyId'; params: { storyId: string } };
 
 export interface ListActivityRow {
 	activity: DBActivity;
@@ -209,25 +206,15 @@ export interface ListActivityRow {
 
 function buildStoryOpenLink(input: {
 	storyId: string;
-	chatId: string | null;
-	storySlug: string;
 	ownerId: string | null;
 	shareId: string | null;
 	viewerId: string;
 }): StoryOpenLink | null {
 	const isOwner = input.ownerId !== null && input.ownerId === input.viewerId;
-	if (isOwner) {
-		return input.chatId
-			? {
-					to: '/stories/preview/$chatId/$storySlug',
-					params: { chatId: input.chatId, storySlug: input.storySlug },
-				}
-			: { to: '/stories/standalone/$storyId', params: { storyId: input.storyId } };
+	if (!isOwner && !input.shareId) {
+		return null;
 	}
-	if (input.shareId) {
-		return { to: '/stories/shared/$shareId', params: { shareId: input.shareId } };
-	}
-	return null;
+	return { to: '/stories/$storyId', params: { storyId: input.storyId } };
 }
 
 /**
@@ -311,8 +298,6 @@ export const listRecentActivities = async (
 		storyLink: row.storyId
 			? buildStoryOpenLink({
 					storyId: row.storyId,
-					chatId: row.storyChatId,
-					storySlug: row.storySlug!,
 					ownerId: row.storyChatOwnerId ?? row.storyUserId,
 					shareId: row.storyShareId ?? row.storyProjectShareId,
 					viewerId: userId,
@@ -371,6 +356,12 @@ function visibleToUser(projectId: string, userId: string) {
 			INNER JOIN ${s.sharedStoryAccess} ssa ON ssa.shared_story_id = ss.id
 			WHERE ss.story_id = ${s.activity.storyId} AND ssa.user_id = ${userId}
 		)`,
+		sql`EXISTS (
+			SELECT 1 FROM ${s.sharedStory} ss
+			INNER JOIN ${s.sharedStoryGroupAccess} ssga ON ssga.shared_story_id = ss.id
+			INNER JOIN ${s.userGroupMember} ugm ON ugm.group_id = ssga.group_id
+			WHERE ss.story_id = ${s.activity.storyId} AND ugm.user_id = ${userId}
+		)`,
 	);
 
 	const storyShareIncludesUser = or(
@@ -384,6 +375,12 @@ function visibleToUser(projectId: string, userId: string) {
 			SELECT 1 FROM ${s.sharedStoryAccess} ssa
 			WHERE ssa.shared_story_id = ${s.activity.sharedStoryId}
 				AND ssa.user_id = ${userId}
+		)`,
+		sql`EXISTS (
+			SELECT 1 FROM ${s.sharedStoryGroupAccess} ssga
+			INNER JOIN ${s.userGroupMember} ugm ON ugm.group_id = ssga.group_id
+			WHERE ssga.shared_story_id = ${s.activity.sharedStoryId}
+				AND ugm.user_id = ${userId}
 		)`,
 	);
 

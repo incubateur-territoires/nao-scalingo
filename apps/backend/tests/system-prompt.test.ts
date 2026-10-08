@@ -257,6 +257,16 @@ describe('SystemPrompt saved files rules', () => {
 		expect(markdown).not.toContain('**save_to**');
 	});
 
+	it('does not recommend save_to when write only serves custom stories', () => {
+		const markdown = renderToMarkdown(
+			SystemPrompt({
+				toolNames: ['execute_sql', 'write', 'story'],
+				options: { savedFilesEnabled: false, customStoriesEnabled: true },
+			}),
+		);
+		expect(markdown).not.toContain('**save_to**');
+	});
+
 	it('explains that an attachment arrives as a path, not as content', () => {
 		const markdown = renderToMarkdown(SystemPrompt({}));
 		expect(markdown).toContain('**/home/uploads**');
@@ -421,6 +431,20 @@ describe('SystemPrompt SQL query rules', () => {
 		expect(markdown).toContain(
 			'must come from a query executed in this conversation, or be computed from such results',
 		);
+	});
+});
+
+describe('SystemPrompt follow-up suggestions rules', () => {
+	it('asks for a closing sentence pointing the user to the suggestions', () => {
+		const markdown = renderToMarkdown(SystemPrompt({}));
+
+		expect(markdown).toContain('**suggest_follow_ups**');
+		expect(markdown).toContain('points the user to the suggestions shown below your message');
+		expect(markdown).toContain('never a note to yourself or part of your thinking');
+	});
+
+	it('omits the rule when the run excludes the tool', () => {
+		expect(renderToMarkdown(SystemPrompt({ toolNames: ['execute_sql'] }))).not.toContain('suggest_follow_ups');
 	});
 });
 

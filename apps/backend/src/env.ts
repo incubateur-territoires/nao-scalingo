@@ -224,6 +224,8 @@ const baseRawEnvSchema = z.object({
 	SLACK_TRANSPORT_MODE: z.enum(['webhook', 'socket']).optional(),
 
 	FASTAPI_PORT: z.coerce.number().default(8005),
+	/** On SIGTERM, how long /api/health reports unhealthy while still serving, so a load balancer can move traffic away. */
+	SHUTDOWN_DRAIN_DELAY_MS: z.coerce.number().int().nonnegative().default(0),
 	APP_VERSION: z.string().default('dev'),
 	APP_COMMIT: z.string().default('unknown'),
 	APP_BUILD_DATE: z.string().default(''),
@@ -231,6 +233,12 @@ const baseRawEnvSchema = z.object({
 	NAO_DEFAULT_PROJECT_PATH: z.string().optional(),
 	NAO_MODE: z.enum(['self-hosted', 'cloud']).default('self-hosted'),
 	NAO_PROJECTS_DIR: z.string().default('./projects'),
+	/** Enables the internal cloud backoffice API and is only honoured when NAO_MODE=cloud. */
+	NAO_BACKOFFICE_API_KEY: z
+		.string()
+		.optional()
+		.transform((val) => val?.trim() || undefined)
+		.pipe(z.string().min(32).optional()),
 	NAO_CORE_VERSION: z.string().optional(),
 	NAO_CONTEXT_SOURCE: z.enum(['local', 'git', 'api']).optional(),
 	NAO_CONTEXT_GIT_URL: z.string().optional(),
@@ -239,6 +247,32 @@ const baseRawEnvSchema = z.object({
 	NAO_CONTEXT_GIT_TOKEN: z.string().optional(),
 	NAO_CONTEXT_GIT_SSH_KEY: z.string().optional(),
 	NAO_CONTEXT_GIT_PLATFORM: z.enum(['github', 'gitlab', 'bitbucket']).optional(),
+
+	CLOUD_BILLING_ENABLED: z
+		.enum(['true', 'false'])
+		.optional()
+		.default('false')
+		.transform((val) => val === 'true'),
+	STRIPE_SECRET_KEY: z
+		.string()
+		.optional()
+		.transform((val) => val?.trim() || undefined),
+	STRIPE_WEBHOOK_SECRET: z
+		.string()
+		.optional()
+		.transform((val) => val?.trim() || undefined),
+	STRIPE_CLOUD_PRODUCT_ID: z
+		.string()
+		.optional()
+		.transform((val) => val?.trim() || undefined),
+	STRIPE_CLOUD_MONTHLY_PRICE_LOOKUP_KEY: z
+		.string()
+		.optional()
+		.transform((val) => val?.trim() || undefined),
+	STRIPE_PORTAL_CONFIGURATION_ID: z
+		.string()
+		.optional()
+		.transform((val) => val?.trim() || undefined),
 
 	NAO_STORAGE_BACKEND: z.enum(['none', 'local', 's3']).default('local'),
 	NAO_STORAGE_LOCAL_PATH: z.string().default('./storage'),
@@ -387,13 +421,19 @@ const baseRawEnvSchema = z.object({
 	BETA_CONTEXT_RECOMMENDATIONS_ENABLED: z
 		.enum(['true', 'false'])
 		.optional()
-		.default('false')
+		.default('true')
 		.transform((val) => val === 'true'),
 
 	BETA_STORY_FILTERS_ENABLED: z
 		.enum(['true', 'false'])
 		.optional()
 		.default('true')
+		.transform((val) => val === 'true'),
+
+	BETA_CUSTOM_STORIES_ENABLED: z
+		.enum(['true', 'false'])
+		.optional()
+		.default('false')
 		.transform((val) => val === 'true'),
 
 	BETA_SUBAGENTS_ENABLED: z
@@ -406,6 +446,23 @@ const baseRawEnvSchema = z.object({
 const rawEnvSchema = z.preprocess(resolveDeprecatedEnvAliases, baseRawEnvSchema);
 const envSchema = rawEnvSchema
 	.superRefine((data, ctx) => {
+		if (isCloudBillingEnabled(data)) {
+			for (const variable of [
+				'STRIPE_SECRET_KEY',
+				'STRIPE_WEBHOOK_SECRET',
+				'STRIPE_CLOUD_PRODUCT_ID',
+				'STRIPE_CLOUD_MONTHLY_PRICE_LOOKUP_KEY',
+			] as const) {
+				if (!data[variable]) {
+					ctx.addIssue({
+						code: 'custom',
+						path: [variable],
+						message: `${variable} is required when cloud billing is enabled`,
+					});
+				}
+			}
+		}
+
 		if (!data.SLACK_BOT_TOKEN) {
 			if (data.SLACK_SIGNING_SECRET || data.SLACK_APP_TOKEN || data.SLACK_TRANSPORT_MODE) {
 				ctx.addIssue({
@@ -489,6 +546,12 @@ export function __reloadEnvForTesting(): void {
 
 export const isCloud = env.NAO_MODE === 'cloud';
 export const isSelfHosted = env.NAO_MODE === 'self-hosted';
+
+export function isCloudBillingEnabled(
+	data: Pick<z.output<typeof baseRawEnvSchema>, 'NAO_MODE' | 'CLOUD_BILLING_ENABLED'> = env,
+): boolean {
+	return data.NAO_MODE === 'cloud' && data.CLOUD_BILLING_ENABLED;
+}
 
 const normalizedBaseUrl = env.BETTER_AUTH_URL.replace(/\/+$/, '');
 export const MCP_SERVER_URL = `${normalizedBaseUrl}/mcp`;

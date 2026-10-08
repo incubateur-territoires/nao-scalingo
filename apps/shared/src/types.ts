@@ -22,9 +22,101 @@ export const TOOL_CALL_DENSITIES = ['compact', 'detailed'] as const;
 /** How much detail to show for tool calls in the chat. */
 export type ToolCallDensity = (typeof TOOL_CALL_DENSITIES)[number];
 
+export const NOTIFICATION_CHANNELS = ['in_app', 'email', 'slack'] as const;
+export type NotificationChannel = (typeof NOTIFICATION_CHANNELS)[number];
+
+export const NOTIFICATION_CATEGORIES = ['budget', 'feedback', 'story_refresh', 'shared', 'subscription'] as const;
+export type NotificationCategory = (typeof NOTIFICATION_CATEGORIES)[number];
+
+export const NOTIFICATION_CATEGORY_LABELS: Record<NotificationCategory, string> = {
+	budget: 'Budget alerts',
+	feedback: 'Feedback alerts',
+	story_refresh: 'Story refreshes',
+	shared: 'Shared with you',
+	subscription: 'Subscriptions',
+};
+
+export const NOTIFICATION_CATEGORY_DESCRIPTIONS: Record<NotificationCategory, string> = {
+	budget: 'Alerts when a provider budget limit is reached.',
+	feedback: 'Alerts when users leave positive or negative feedback.',
+	story_refresh: 'Results of your story refreshes.',
+	shared: 'When someone shares a story or chat with you.',
+	subscription: "When you're added to a story's scheduled delivery.",
+};
+
+export type SharedItemLabel = 'story' | 'chat';
+
+export type ShareSource = { type: 'chat'; shareId: string } | { type: 'story'; storyId: string };
+
+export type FeedbackNotificationPayload = {
+	kind: 'feedback';
+	vote: 'up' | 'down';
+	submitterName: string;
+	chatTitle: string | null;
+	explanation: string | null;
+};
+
+export type SharedNotificationPayload = {
+	kind: 'shared';
+	sharerName: string;
+	itemLabel: SharedItemLabel;
+	itemTitle: string;
+	visibility: Visibility;
+};
+
+export type StoryRefreshNotificationPayload = {
+	kind: 'story_refresh';
+	storyId: string;
+	status: 'refreshed' | 'failed';
+	queriesRefreshed?: number;
+	trigger?: 'manual' | 'schedule';
+	ownerName?: string;
+	storyTitle?: string;
+};
+
+export type StorySubscriptionNotificationPayload = {
+	kind: 'story_subscription';
+	storyId: string;
+	storyTitle: string;
+	ownerName: string;
+};
+
 export const DEFAULT_PYTHON_EXECUTION_DURATION_SECS = 30;
 export const MIN_PYTHON_EXECUTION_DURATION_SECS = 1;
 export const MAX_PYTHON_EXECUTION_DURATION_SECS = 600;
+
+/** Sandbox secrets are exposed to code as environment variables, so their names must be valid POSIX identifiers. */
+export const SANDBOX_SECRET_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
+export const SANDBOX_SECRET_NAME_MAX_LENGTH = 64;
+/** Anything shorter is not a secret, and would be masked from sandbox output far too eagerly. */
+export const SANDBOX_SECRET_VALUE_MIN_LENGTH = 4;
+export const SANDBOX_SECRET_VALUE_MAX_LENGTH = 8192;
+export const SANDBOX_SECRET_DESCRIPTION_MAX_LENGTH = 200;
+
+/** Environment variables the guest runtime relies on; a secret shadowing one would break the sandbox. */
+export const SANDBOX_SECRET_RESERVED_NAMES = new Set([
+	'PATH',
+	'HOME',
+	'USER',
+	'SHELL',
+	'PWD',
+	'TERM',
+	'LANG',
+	'LC_ALL',
+	'TMPDIR',
+	'HOSTNAME',
+	'LD_PRELOAD',
+	'LD_LIBRARY_PATH',
+	'PYTHONPATH',
+	'PYTHONHOME',
+	'PYTHONSTARTUP',
+	'NODE_OPTIONS',
+	'NODE_PATH',
+]);
+
+export function isReservedSandboxSecretName(name: string): boolean {
+	return SANDBOX_SECRET_RESERVED_NAMES.has(name) || name.startsWith('LD_') || name.startsWith('LC_');
+}
 
 export const SEMANTIC_LAYER_MODES = ['exclusive', 'prioritized', 'disabled'] as const;
 
@@ -165,6 +257,7 @@ export type FileTreeEntry = {
 	path: string;
 	type: 'file' | 'directory';
 	children?: FileTreeEntry[];
+	readOnly?: boolean;
 };
 
 export type ContextGitUnavailableReason =
@@ -259,6 +352,7 @@ export type Visibility = (typeof SHARE_VISIBILITY)[number];
 export type StorySharingInfo = {
 	visibility: Visibility;
 	sharedWithCount: number;
+	sharedWithGroupCount: number;
 	isPinned: boolean;
 };
 
@@ -267,6 +361,15 @@ export type FolderVisibility = (typeof FOLDER_VISIBILITY)[number];
 
 export const FOLDER_SYSTEM_TYPE = ['private_folder', 'shared_with_me'] as const;
 export type FolderSystemType = (typeof FOLDER_SYSTEM_TYPE)[number];
+
+export const STORY_ACTIONS = ['create', 'update', 'replace', 'publish'] as const;
+export type StoryAction = (typeof STORY_ACTIONS)[number];
+
+export const STORY_SOURCES = ['assistant', 'user'] as const;
+export type StorySource = (typeof STORY_SOURCES)[number];
+
+export const STORY_FORMATS = ['classic', 'custom'] as const;
+export type StoryFormat = (typeof STORY_FORMATS)[number];
 
 export type ProjectChatReplayFacets<R extends string = string> = {
 	userNames: string[];
@@ -327,6 +430,13 @@ export interface CitationData {
 	end: number;
 	text: string;
 	storySlug?: string;
+	block?: StoryBlockReference;
+}
+
+export interface StoryBlockReference {
+	kind: string;
+	title?: string;
+	queryId?: string;
 }
 
 export type MessageBubble = { role: 'user' | 'assistant'; charCount: number };

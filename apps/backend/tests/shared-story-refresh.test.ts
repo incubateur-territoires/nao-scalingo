@@ -4,6 +4,7 @@ import type { EffectiveUserGroupAccess } from '../src/queries/user-group.queries
 
 const mocks = vi.hoisted(() => ({
 	getSharedStory: vi.fn(),
+	getSharedStoryByStoryId: vi.fn(),
 	canUserAccessSharedStory: vi.fn(),
 	getUserRoleInProject: vi.fn(),
 	getStoryByChatAndSlug: vi.fn(),
@@ -34,6 +35,7 @@ vi.mock('../src/queries/project.queries', () => ({
 }));
 vi.mock('../src/queries/shared-story.queries', () => ({
 	getSharedStory: mocks.getSharedStory,
+	getSharedStoryByStoryId: mocks.getSharedStoryByStoryId,
 	canUserAccessSharedStory: mocks.canUserAccessSharedStory,
 }));
 vi.mock('../src/queries/story.queries', () => ({
@@ -71,7 +73,7 @@ const testRouter = router({ storyShare: sharedStoryRoutes });
 describe('shared Story manual refresh', () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
-		mocks.getSharedStory.mockResolvedValue({
+		mocks.getSharedStoryByStoryId.mockResolvedValue({
 			id: 'share-1',
 			projectId: 'project-1',
 			userId: 'sharer-1',
@@ -112,22 +114,74 @@ describe('shared Story manual refresh', () => {
 		['admin', 'admin-1', true],
 		['member', 'member-1', false],
 	] as const)('reports refresh capability for the %s', async (_label, userId, expected) => {
-		const story = await createCaller(userId).storyShare.get({ shareId: 'share-1' });
+		const story = await createCaller(userId).storyShare.get({ storyId: 'story-1' });
 
 		expect(story.canRefresh).toBe(expected);
+		expect(mocks.getSharedStoryByStoryId).toHaveBeenCalledWith('story-1');
+		expect(mocks.getSharedStory).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['owner', 'owner-1', true],
+		['member', 'member-1', false],
+	] as const)(
+		'defers the refresh after a failure only when the %s can retry it',
+		async (_label, userId, expected) => {
+			mocks.getLatestStoryRefreshFailure.mockResolvedValue({
+				errorMessage: 'No output generated.',
+				failedAt: new Date('2026-09-12T10:00:00.000Z'),
+			});
+
+			await createCaller(userId).storyShare.get({ storyId: 'story-1' });
+
+			expect(mocks.getStoryQueryData).toHaveBeenCalledWith('chat-1', 'orders', undefined, true, null, {
+				deferRefresh: expected,
+				deferFirstRefresh: expected,
+			});
+		},
+	);
+
+	it.each([
+		['owner', 'owner-1', true],
+		['member', 'member-1', false],
+	] as const)('defers the first refresh only when the %s can run it', async (_label, userId, expected) => {
+		await createCaller(userId).storyShare.get({ storyId: 'story-1' });
+
+		expect(mocks.getStoryQueryData).toHaveBeenCalledWith('chat-1', 'orders', undefined, true, null, {
+			deferRefresh: false,
+			deferFirstRefresh: expected,
+		});
+	});
+
+	it('leaves the data of a shared custom story to its own endpoints', async () => {
+		mocks.getSharedStoryByStoryId.mockResolvedValue({
+			id: 'share-1',
+			projectId: 'project-1',
+			userId: 'sharer-1',
+			visibility: 'project',
+			storyId: 'story-1',
+			chatId: 'chat-1',
+			slug: 'orders',
+			format: 'custom',
+		});
+
+		const story = await createCaller('owner-1').storyShare.get({ storyId: 'story-1' });
+
+		expect(mocks.getStoryQueryData).not.toHaveBeenCalled();
+		expect(story).toMatchObject({ queryData: null, needsRefresh: false });
 	});
 
 	it('resolves fork permission against the shared Story project', async () => {
 		mocks.resolveUserGroupAccess.mockResolvedValue(createEffectiveUserGroupAccess(['storyCreation']));
 
-		const story = await createCaller('member-1', 'selected-project').storyShare.get({ shareId: 'share-1' });
+		const story = await createCaller('member-1', 'selected-project').storyShare.get({ storyId: 'story-1' });
 
 		expect(story.canFork).toBe(true);
 		expect(mocks.resolveUserGroupAccess).toHaveBeenCalledWith('project-1', 'member-1');
 	});
 
 	it('allows the owner to fork without checking the creation grant', async () => {
-		const story = await createCaller('sharer-1', 'selected-project').storyShare.get({ shareId: 'share-1' });
+		const story = await createCaller('sharer-1', 'selected-project').storyShare.get({ storyId: 'story-1' });
 
 		expect(story.canFork).toBe(true);
 		expect(mocks.resolveUserGroupAccess).not.toHaveBeenCalled();
@@ -136,14 +190,14 @@ describe('shared Story manual refresh', () => {
 	it('blocks viewers from forking even with the creation grant', async () => {
 		mocks.resolveUserGroupAccess.mockResolvedValue(createEffectiveUserGroupAccess(['storyCreation']));
 
-		const story = await createCaller('viewer-1', 'selected-project').storyShare.get({ shareId: 'share-1' });
+		const story = await createCaller('viewer-1', 'selected-project').storyShare.get({ storyId: 'story-1' });
 
 		expect(story.canFork).toBe(false);
 		expect(mocks.resolveUserGroupAccess).not.toHaveBeenCalled();
 	});
 
 	it('rejects a viewer before refreshing the shared cache', async () => {
-		await expect(createCaller('viewer-1').storyShare.refreshData({ shareId: 'share-1' })).rejects.toMatchObject({
+		await expect(createCaller('viewer-1').storyShare.refreshData({ storyId: 'story-1' })).rejects.toMatchObject({
 			code: 'FORBIDDEN',
 		});
 
@@ -152,7 +206,7 @@ describe('shared Story manual refresh', () => {
 	});
 
 	it('lets the owner refresh using the owner execution principal', async () => {
-		await createCaller('owner-1').storyShare.refreshData({ shareId: 'share-1' });
+		await createCaller('owner-1').storyShare.refreshData({ storyId: 'story-1' });
 
 		expect(mocks.refreshStoryData).toHaveBeenCalledWith('chat-1', 'orders');
 		expect(mocks.startStoryRefreshActivity).toHaveBeenCalledWith({
@@ -167,7 +221,7 @@ describe('shared Story manual refresh', () => {
 	});
 
 	it('lets an admin trigger an owner-scoped refresh while recording the admin actor', async () => {
-		await createCaller('admin-1').storyShare.refreshData({ shareId: 'share-1' });
+		await createCaller('admin-1').storyShare.refreshData({ storyId: 'story-1' });
 
 		expect(mocks.refreshStoryData).toHaveBeenCalledWith('chat-1', 'orders');
 		expect(mocks.startStoryRefreshActivity).toHaveBeenCalledWith(expect.objectContaining({ userId: 'owner-1' }));
@@ -179,7 +233,7 @@ describe('shared Story manual refresh', () => {
 		const refreshError = new Error('Warehouse unavailable');
 		mocks.refreshStoryData.mockRejectedValueOnce(refreshError);
 
-		await expect(createCaller('owner-1').storyShare.refreshData({ shareId: 'share-1' })).rejects.toMatchObject({
+		await expect(createCaller('owner-1').storyShare.refreshData({ storyId: 'story-1' })).rejects.toMatchObject({
 			message: 'Warehouse unavailable',
 			cause: refreshError,
 		});

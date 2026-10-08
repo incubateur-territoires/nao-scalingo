@@ -24,16 +24,16 @@ import * as telegramConfigQueries from '../queries/project-telegram-config.queri
 import * as whatsappConfigQueries from '../queries/project-whatsapp-config.queries';
 import * as projectWhatsappLinkQueries from '../queries/project-whatsapp-link.queries';
 import * as userQueries from '../queries/user.queries';
-import { cleanupContextWorktree } from '../services/context-explorer-git.service';
 import { mattermostService } from '../services/mattermost';
 import { MattermostConnectionError, validateMattermostConnection } from '../services/mattermost-helpers';
 import { mcpService } from '../services/mcp';
+import { removeProjectMember } from '../services/membership.service';
 import { posthog, PostHogEvent } from '../services/posthog';
 import { slackService } from '../services/slack';
 import { listAvailableTranscribeModels as getAvailableTranscribeModels } from '../services/transcribe.service';
 import { isDatabaseObjectAllowed, resolveWarehouseTableAccess } from '../services/user-group-context-access.service';
 import { AgentSettings } from '../types/agent-settings';
-import type { ContextUsage } from '../types/chat';
+import type { ContextUsage, MessageModel } from '../types/chat';
 import {
 	configLlmProviderSchema,
 	customModelMetadataSchema,
@@ -50,6 +50,7 @@ import {
 	getEnvProviders,
 	getProjectAvailableModels,
 	getProjectConfigLlm,
+	getProjectModelNameResolver,
 } from '../utils/llm';
 import { extractConfiguredSemanticLayer, extractRequiredEnvVars } from '../utils/nao-config';
 import { findConfigLlmProvider } from '../utils/nao-config-llm';
@@ -319,6 +320,7 @@ export const projectRoutes = {
 					autoCreateUsersEnabled: config.autoCreateUsersEnabled,
 					autoCreateUsersDomains: config.autoCreateUsersDomains,
 					replyMode: config.replyMode,
+					dmScopeMissing: config.dmScopeMissing,
 				}
 			: null;
 
@@ -823,7 +825,7 @@ export const projectRoutes = {
 	}),
 
 	listUsersWithAccess: projectProtectedProcedure.query(async ({ ctx }) => {
-		return projectQueries.listUsersWithProjectAccess(ctx.project.id);
+		return projectQueries.listUsersWithProjectAccessDetails(ctx.project.id);
 	}),
 
 	getProjectMembersByChatId: protectedProcedure
@@ -855,16 +857,7 @@ export const projectRoutes = {
 			}),
 		)
 		.mutation(async ({ ctx, input }) => {
-			const role = await projectQueries.getUserRoleInProject(ctx.project!.id, input.userId);
-			if (role === 'admin') {
-				throw new Error('Cannot remove an admin from the project.');
-			}
-
-			await projectQueries.removeProjectMember(ctx.project.id, input.userId);
-			const remainingRole = await projectQueries.getUserRoleInProject(ctx.project.id, input.userId);
-			if (ctx.project.path && remainingRole !== 'admin' && remainingRole !== 'context_admin') {
-				await cleanupContextWorktree(ctx.project.id, ctx.project.path, input.userId);
-			}
+			await removeProjectMember(ctx.project.id, input.userId);
 		}),
 
 	getSavedPrompts: projectProtectedProcedure.query(async ({ ctx }) => {
@@ -1131,12 +1124,22 @@ export const projectRoutes = {
 				};
 			}
 
+			const [assistantModels, resolveModelName] = await Promise.all([
+				chatQueries.getAssistantMessageModels(input.chatId),
+				getProjectModelNameResolver(ctx.project.id),
+			]);
+			const messageModels: Record<string, MessageModel> = {};
+			for (const { messageId, provider, modelId } of assistantModels) {
+				messageModels[messageId] = { provider, modelId, name: resolveModelName(provider, modelId) };
+			}
+
 			return {
 				...chat,
 				ownerId: ownerId ?? null,
 				ownerName,
 				chatOwnerId: ownerId ?? null,
 				feedbackRecommendations,
+				messageModels,
 			};
 		}),
 

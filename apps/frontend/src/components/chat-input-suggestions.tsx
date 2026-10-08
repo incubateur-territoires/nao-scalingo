@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useMutation } from '@tanstack/react-query';
-import { MessageSquare, X, ThumbsDown, ThumbsUp, Check, Plug } from 'lucide-react';
+import { Activity, MessageSquare, X, ThumbsDown, ThumbsUp, Check, Plug } from 'lucide-react';
 import { FeedbackDialog } from './chat-messages/assistant-message-actions';
 import { Button } from './ui/button';
 import StoryIcon from './ui/story-icon';
 import type { UIMessage, UIToolPart } from '@nao/backend/chat';
 import type { FeedbackVote } from './chat-messages/assistant-message-actions';
+import { useStoryViewerLiveSettings } from '@/components/side-panel/hooks/use-story-viewer-live-settings';
+import { LiveStorySettingsDialog } from '@/components/side-panel/live-story-settings-dialog';
 import { useAgentContext, useAgentMessages } from '@/contexts/agent.provider';
 import { useChatId } from '@/hooks/use-chat-id';
 import { useInactivityTrigger } from '@/hooks/use-inactivity-trigger';
@@ -18,14 +20,20 @@ import { openMcpConnectPopup } from '@/lib/mcp-oauth';
 import { cn } from '@/lib/utils';
 import { trpc } from '@/main';
 
-/** Milliseconds of inactivity before we ask the user how the conversation went. */
-const FEEDBACK_INACTIVITY_MS = 10_000;
+/**
+ * Milliseconds of inactivity before we ask the user how the conversation went, indexed by how many
+ * times they dismissed the prompt across all chats. Every dismissal pushes the next prompt further out.
+ */
+const FEEDBACK_INACTIVITY_LADDER_MS = [10_000, 15_000, 25_000, 30_000, 45_000, 60_000];
 /** How many charts must exist in a chat before we offer to turn them into a story. */
 const STORY_CHART_THRESHOLD = 2;
 /** Message sent on behalf of the user when they accept the story suggestion. */
 const STORY_SUGGESTION_MESSAGE = 'Create a story from the charts in this conversation.';
 
 const storyProposalDisabledStorage = createLocalStorage<boolean>('nao-story-proposal-disabled', false);
+const liveStoryProposalDismissedStorage = createLocalStorage<string[]>('nao-live-story-proposal-dismissed', []);
+const feedbackDismissCountStorage = createLocalStorage<number>('nao-feedback-prompt-dismiss-count', 0);
+const feedbackDismissedChatsStorage = createLocalStorage<string[]>('nao-feedback-prompt-dismissed-chats', []);
 
 /**
  * A floating panel that sits above the chat input and surfaces a single
@@ -45,9 +53,10 @@ export function ChatInputSuggestions({
 	const { isReadonly } = useAgentContext();
 	const mcpAuth = useMcpAuthSuggestion();
 	const story = useStorySuggestion();
+	const liveStory = useLiveStorySuggestion();
 	const feedback = useConversationFeedback();
 
-	const content = renderSuggestion({ isReadonly, storyCreationEnabled, mcpAuth, story, feedback });
+	const content = renderSuggestion({ isReadonly, storyCreationEnabled, mcpAuth, story, liveStory, feedback });
 	const isCollapsed = isHidden || !content;
 	const { ref, height } = useMeasuredHeight();
 
@@ -91,12 +100,14 @@ function renderSuggestion({
 	storyCreationEnabled,
 	mcpAuth,
 	story,
+	liveStory,
 	feedback,
 }: {
 	isReadonly: boolean | undefined;
 	storyCreationEnabled: boolean;
 	mcpAuth: McpAuthSuggestion;
 	story: StorySuggestion;
+	liveStory: LiveStorySuggestion;
 	feedback: ConversationFeedback;
 }) {
 	if (isReadonly) {
@@ -151,6 +162,36 @@ function renderSuggestion({
 					Yes
 				</Button>
 			</SuggestionCard>
+		);
+	}
+
+	if (liveStory.isVisible) {
+		return (
+			<>
+				<SuggestionCard
+					icon={<Activity className='size-4 text-primary' />}
+					message='Keep this story up to date?'
+					description='A live story re-runs its queries on a schedule, so its charts and numbers stay current instead of staying frozen at the moment it was created.'
+				>
+					<Button
+						variant='ghost'
+						size='sm'
+						className='rounded-full text-muted-foreground'
+						onClick={liveStory.dismiss}
+					>
+						Not now
+					</Button>
+					<Button variant='primary-gradient' size='sm' className='rounded-full' onClick={liveStory.accept}>
+						Make it live
+					</Button>
+				</SuggestionCard>
+				<LiveStorySettingsDialog
+					open={liveStory.isSettingsOpen}
+					onOpenChange={liveStory.setSettingsOpen}
+					proposeLive
+					{...liveStory.settings}
+				/>
+			</>
 		);
 	}
 
@@ -330,6 +371,119 @@ function useStorySuggestion(): StorySuggestion {
 	return { isVisible, accept, dismiss, neverPropose: handleNeverPropose };
 }
 
+interface LiveStorySuggestion {
+	isVisible: boolean;
+	isSettingsOpen: boolean;
+	setSettingsOpen: (open: boolean) => void;
+	settings: {
+		chatId: string;
+		storySlug: string;
+		isLive: boolean;
+		isLiveTextDynamic: boolean;
+		cacheSchedule: string | null;
+		cacheScheduleDescription: string | null;
+		isUpdating: boolean;
+		onSaveSettings: (settings: {
+			isLive: boolean;
+			isLiveTextDynamic: boolean;
+			cacheSchedule: string | null;
+			cacheScheduleDescription: string | null;
+		}) => void;
+	};
+	accept: () => void;
+	dismiss: () => void;
+}
+
+/**
+ * Offers live mode for the story the agent just created. Live stories are otherwise only
+ * discoverable through the toggle on the story itself, so most stories stay static snapshots.
+ * Accepting opens the usual live settings dialog, already proposing a daily refresh.
+ */
+function useLiveStorySuggestion(): LiveStorySuggestion {
+	const { isRunning, isReadonly } = useAgentContext();
+	const messages = useAgentMessages();
+	const chatId = useChatId();
+
+	const [dismissedStories, setDismissedStories] = useState<ReadonlySet<string>>(
+		() => new Set(liveStoryProposalDismissedStorage.get() ?? []),
+	);
+	const [isSettingsOpen, setSettingsOpen] = useState(false);
+
+	const storySlug = useMemo(() => findLatestCreatedStorySlug(messages), [messages]);
+	const isPersistedChat = !!chatId && chatId !== NEW_CHAT_ID;
+	const dismissalKey = isPersistedChat && storySlug ? `${chatId}:${storySlug}` : null;
+
+	const {
+		storyId,
+		isLive,
+		isLiveTextDynamic,
+		cacheSchedule,
+		cacheScheduleDescription,
+		isUpdating,
+		handleSaveSettings,
+	} = useStoryViewerLiveSettings({
+		chatId: chatId ?? '',
+		storySlug: storySlug ?? '',
+		enabled: isPersistedChat && !!storySlug && !isReadonly,
+	});
+
+	useEffect(() => {
+		setSettingsOpen(false);
+	}, [chatId, storySlug]);
+
+	/** `storyId` is only set once the story query resolves, so it also guards against a premature `isLive` of false. */
+	const isVisible = !!dismissalKey && !isRunning && !dismissedStories.has(dismissalKey) && !!storyId && !isLive;
+
+	const dismiss = useCallback(() => {
+		if (!dismissalKey) {
+			return;
+		}
+		setDismissedStories((prev) => {
+			const next = new Set(prev).add(dismissalKey);
+			liveStoryProposalDismissedStorage.set([...next]);
+			return next;
+		});
+	}, [dismissalKey]);
+
+	const accept = useCallback(() => setSettingsOpen(true), []);
+
+	return {
+		isVisible,
+		isSettingsOpen,
+		setSettingsOpen,
+		settings: {
+			chatId: chatId ?? '',
+			storySlug: storySlug ?? '',
+			isLive,
+			isLiveTextDynamic,
+			cacheSchedule,
+			cacheScheduleDescription,
+			isUpdating,
+			onSaveSettings: handleSaveSettings,
+		},
+		accept,
+		dismiss,
+	};
+}
+
+/** Returns the slug of the most recently created story, ignoring later updates to it. */
+function findLatestCreatedStorySlug(messages: UIMessage[]): string | null {
+	for (let m = messages.length - 1; m >= 0; m--) {
+		const parts = messages[m]?.parts ?? [];
+
+		for (let p = parts.length - 1; p >= 0; p--) {
+			const part = parts[p];
+			if (part.type !== 'tool-story' || part.input?.action !== 'create') {
+				continue;
+			}
+			if (part.output?.success && part.output.version === 1) {
+				return part.output.id;
+			}
+		}
+	}
+	return null;
+}
+
 interface ConversationFeedback {
 	isVisible: boolean;
 	showThanks: boolean;
@@ -347,7 +501,10 @@ function useConversationFeedback(): ConversationFeedback {
 	const messages = useAgentMessages();
 	const chatId = useChatId();
 
-	const [dismissedChats, setDismissedChats] = useState<ReadonlySet<string>>(() => new Set());
+	const [dismissCount, setDismissCount] = useState(() => feedbackDismissCountStorage.get() ?? 0);
+	const [dismissedChats, setDismissedChats] = useState<ReadonlySet<string>>(
+		() => new Set(feedbackDismissedChatsStorage.get() ?? []),
+	);
 	const [thanksForChat, setThanksForChat] = useState<string | null>(null);
 	const [feedbackDialogVote, setFeedbackDialogVote] = useState<FeedbackVote>('down');
 	const [feedbackDialogOpen, setFeedbackDialogOpen] = useState(false);
@@ -384,24 +541,33 @@ function useConversationFeedback(): ConversationFeedback {
 
 	const isTriggered = useInactivityTrigger({
 		enabled: isEligible,
-		delayMs: FEEDBACK_INACTIVITY_MS,
+		delayMs: feedbackInactivityDelay(dismissCount),
 		resetKey: `${chatId}:${messages.length}`,
 	});
 
 	const showThanks = !!chatId && thanksForChat === chatId;
+
+	const dismissForChat = useCallback(() => {
+		if (!chatId) {
+			return;
+		}
+		setDismissedChats((prev) => {
+			const next = new Set(prev).add(chatId);
+			feedbackDismissedChatsStorage.set([...next]);
+			return next;
+		});
+	}, [chatId]);
 
 	useEffect(() => {
 		if (!showThanks) {
 			return;
 		}
 		const timer = window.setTimeout(() => {
-			if (chatId) {
-				setDismissedChats((prev) => new Set(prev).add(chatId));
-			}
+			dismissForChat();
 			setThanksForChat(null);
 		}, 2_500);
 		return () => window.clearTimeout(timer);
-	}, [showThanks, chatId]);
+	}, [showThanks, dismissForChat]);
 
 	const vote = useCallback(
 		(value: FeedbackVote, explanation?: string) => {
@@ -421,10 +587,13 @@ function useConversationFeedback(): ConversationFeedback {
 	}, []);
 
 	const dismiss = useCallback(() => {
-		if (chatId) {
-			setDismissedChats((prev) => new Set(prev).add(chatId));
-		}
-	}, [chatId]);
+		dismissForChat();
+		setDismissCount((prev) => {
+			const next = prev + 1;
+			feedbackDismissCountStorage.set(next);
+			return next;
+		});
+	}, [dismissForChat]);
 
 	return {
 		isVisible: isEligible && isTriggered,
@@ -439,13 +608,20 @@ function useConversationFeedback(): ConversationFeedback {
 	};
 }
 
+function feedbackInactivityDelay(dismissCount: number): number {
+	const index = Math.min(dismissCount, FEEDBACK_INACTIVITY_LADDER_MS.length - 1);
+	return FEEDBACK_INACTIVITY_LADDER_MS[index];
+}
+
 function SuggestionCard({
 	icon,
 	message,
+	description,
 	children,
 }: {
 	icon?: React.ReactNode;
 	message: string;
+	description?: string;
 	children?: React.ReactNode;
 }) {
 	return (
@@ -454,7 +630,10 @@ function SuggestionCard({
 			className='group flex items-center gap-1 rounded-2xl border border-muted-foreground/25 bg-background p-2'
 		>
 			{icon && <div className='flex size-9 shrink-0 items-center justify-center'>{icon}</div>}
-			<p className='min-w-0 flex-1 truncate text-sm font-medium text-foreground'>{message}</p>
+			<div className='min-w-0 flex-1'>
+				<p className='truncate text-sm font-medium text-foreground'>{message}</p>
+				{description && <p className='text-xs text-muted-foreground'>{description}</p>}
+			</div>
 			{children && <div className='flex shrink-0 items-center gap-1'>{children}</div>}
 		</div>
 	);

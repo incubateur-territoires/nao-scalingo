@@ -96,8 +96,9 @@ function DropdownMenuRadioGroup({ ...props }: React.ComponentProps<typeof Dropdo
 function DropdownMenuRadioItem({
 	className,
 	children,
+	indicator = 'dot',
 	...props
-}: React.ComponentProps<typeof DropdownMenuPrimitive.RadioItem>) {
+}: React.ComponentProps<typeof DropdownMenuPrimitive.RadioItem> & { indicator?: 'dot' | 'check' }) {
 	return (
 		<DropdownMenuPrimitive.RadioItem
 			data-slot='dropdown-menu-radio-item'
@@ -109,7 +110,11 @@ function DropdownMenuRadioItem({
 		>
 			<span className='pointer-events-none absolute left-2 flex size-3.5 items-center justify-center'>
 				<DropdownMenuPrimitive.ItemIndicator>
-					<CircleIcon className='size-2 fill-current' />
+					{indicator === 'check' ? (
+						<CheckIcon className='size-4' />
+					) : (
+						<CircleIcon className='size-2 fill-current' />
+					)}
 				</DropdownMenuPrimitive.ItemIndicator>
 			</span>
 			{children}
@@ -171,13 +176,13 @@ function DropdownMenuSubTrigger({
 			data-slot='dropdown-menu-sub-trigger'
 			data-inset={inset}
 			className={cn(
-				"focus:bg-accent focus:text-accent-foreground data-[state=open]:bg-accent data-[state=open]:text-accent-foreground [&_svg:not([class*='text-'])]:text-muted-foreground relative flex w-full items-center gap-2 rounded-sm py-1 pr-2 pl-2 text-sm outline-hidden cursor-pointer select-none not-last:mb-[2px] data-inset:pl-8 *:[span]:last:flex *:[span]:last:items-center *:[span]:last:gap-2 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+				"focus:bg-accent focus:text-accent-foreground data-[state=open]:bg-accent data-[state=open]:text-accent-foreground [&_svg:not([class*='text-'])]:text-foreground relative flex w-full items-center gap-2 rounded-sm py-2 pr-2 pl-2 text-xs font-medium leading-none outline-hidden cursor-pointer select-none not-last:mb-[2px] data-disabled:pointer-events-none data-disabled:opacity-50 data-inset:pl-8 *:[span]:last:flex *:[span]:last:items-center *:[span]:last:gap-2 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
 				className,
 			)}
 			{...props}
 		>
 			{children}
-			<ChevronRightIcon className='ml-auto size-4' />
+			<ChevronRightIcon className='ml-auto size-3.5 text-muted-foreground' />
 		</DropdownMenuPrimitive.SubTrigger>
 	);
 }

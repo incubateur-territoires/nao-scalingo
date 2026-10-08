@@ -46,9 +46,34 @@ export const addOrgMemberIfMissing = async (member: NewOrgMember): Promise<void>
 	await db.insert(s.orgMember).values(member).onConflictDoNothing().execute();
 };
 
+type UserOrgMembership = DBOrgMember & { organization: DBOrganization };
+
 export const getUserOrgMembership = async (
 	userId: string,
-): Promise<(DBOrgMember & { organization: DBOrganization }) | null> => {
+	selectedOrganizationId?: string | null,
+): Promise<UserOrgMembership | null> => {
+	if (selectedOrganizationId) {
+		return findUserOrgMembership(userId, selectedOrganizationId);
+	}
+
+	return findUserOrgMembership(userId);
+};
+
+export const listUserOrgMemberships = async (userId: string) => {
+	return db
+		.select({
+			id: s.organization.id,
+			name: s.organization.name,
+			role: s.orgMember.role,
+		})
+		.from(s.orgMember)
+		.innerJoin(s.organization, eq(s.orgMember.orgId, s.organization.id))
+		.where(eq(s.orgMember.userId, userId))
+		.orderBy(asc(s.organization.name), asc(s.organization.id))
+		.execute();
+};
+
+const findUserOrgMembership = async (userId: string, organizationId?: string): Promise<UserOrgMembership | null> => {
 	const [result] = await db
 		.select({
 			orgId: s.orgMember.orgId,
@@ -59,7 +84,33 @@ export const getUserOrgMembership = async (
 		})
 		.from(s.orgMember)
 		.innerJoin(s.organization, eq(s.orgMember.orgId, s.organization.id))
-		.where(eq(s.orgMember.userId, userId))
+		.where(
+			organizationId
+				? and(eq(s.orgMember.userId, userId), eq(s.orgMember.orgId, organizationId))
+				: eq(s.orgMember.userId, userId),
+		)
+		.orderBy(asc(s.orgMember.createdAt))
+		.limit(1)
+		.execute();
+	return result ?? null;
+};
+
+export const getUserOrgMembershipByProject = async (
+	userId: string,
+	projectId: string,
+): Promise<UserOrgMembership | null> => {
+	const [result] = await db
+		.select({
+			orgId: s.orgMember.orgId,
+			userId: s.orgMember.userId,
+			role: s.orgMember.role,
+			createdAt: s.orgMember.createdAt,
+			organization: s.organization,
+		})
+		.from(s.orgMember)
+		.innerJoin(s.organization, eq(s.orgMember.orgId, s.organization.id))
+		.innerJoin(s.project, eq(s.project.orgId, s.organization.id))
+		.where(and(eq(s.orgMember.userId, userId), eq(s.project.id, projectId)))
 		.limit(1)
 		.execute();
 	return result ?? null;
@@ -120,6 +171,10 @@ export const findOrganizationByEmailDomain = async (email: string): Promise<DBOr
 
 export const updateOrganizationName = async (orgId: string, name: string): Promise<void> => {
 	await db.update(s.organization).set({ name }).where(eq(s.organization.id, orgId)).execute();
+};
+
+export const updateOrganizationBypassBilling = async (orgId: string, bypassBilling: boolean): Promise<void> => {
+	await db.update(s.organization).set({ bypassBilling }).where(eq(s.organization.id, orgId)).execute();
 };
 
 export const updateOrganizationEmailDomains = async (orgId: string, domains: string | null): Promise<void> => {
@@ -359,7 +414,6 @@ export const ensureOrganizationSetup = async (): Promise<void> => {
 	// Ensure a project exists for the current NAO_DEFAULT_PROJECT_PATH
 	await ensureDefaultProject(org);
 };
-
 export interface OrgMemberWithUser {
 	id: string;
 	name: string;
@@ -376,6 +430,33 @@ export interface OrgProjectWithAccess {
 	createdAt: Date;
 	updatedAt: Date;
 }
+
+/**
+ * Everyone who can reach the organization: its members plus project-only members, who are added
+ * from a project's Users & Groups page or auto-provisioned by Slack. Both kinds consume a licensed seat.
+ */
+export const countOrgUsers = async (orgId: string): Promise<number> => {
+	const people = db.$with('org_people').as(
+		db
+			.select({ userId: s.orgMember.userId })
+			.from(s.orgMember)
+			.where(eq(s.orgMember.orgId, orgId))
+			.unionAll(
+				db
+					.select({ userId: s.projectMember.userId })
+					.from(s.projectMember)
+					.innerJoin(s.project, eq(s.projectMember.projectId, s.project.id))
+					.where(eq(s.project.orgId, orgId)),
+			),
+	);
+
+	const rows = await db
+		.with(people)
+		.select({ total: sql<number>`count(distinct ${people.userId})` })
+		.from(people);
+
+	return Number(rows[0]?.total ?? 0);
+};
 
 export const listOrgMembersWithUsers = async (orgId: string): Promise<OrgMemberWithUser[]> => {
 	const rows = await db

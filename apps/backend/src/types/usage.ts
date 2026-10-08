@@ -27,6 +27,9 @@ export const USAGE_PERIOD_PRESETS = {
 } as const satisfies Record<string, UsagePeriodRange>;
 export type UsagePeriodPreset = keyof typeof USAGE_PERIOD_PRESETS;
 
+/** Trailing window for licence reconciliation. Fixed so the number stays comparable to a contract term. */
+export const LICENSE_ACTIVITY_WINDOW = { value: 90, unit: 'day' } as const satisfies UsagePeriodRange;
+
 export const USAGE_PERIOD_PRESET_NAMES = ['24h', '15d', '6m'] as const satisfies readonly UsagePeriodPreset[];
 export const USAGE_PERIOD_MODES = [...USAGE_PERIOD_PRESET_NAMES, 'saved'] as const;
 export const usagePeriodModeSchema = z.enum(USAGE_PERIOD_MODES);
@@ -221,4 +224,16 @@ export interface UsageRecord {
 export interface TotalUsageRecord {
 	totalMessages: number;
 	uniqueUsers: number;
+}
+
+export interface UserUsageBreakdown {
+	userName: string;
+	messageCount: number;
+	totalTokens: number;
+	totalCost: number;
+}
+
+export interface UsageByUserRecord {
+	date: string;
+	users: UserUsageBreakdown[];
 }

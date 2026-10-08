@@ -1,16 +1,17 @@
 import { useCallback } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useIsStoryRefreshing } from '@/hooks/use-is-story-refreshing';
 import { trpc } from '@/main';
 
 interface UseStoryViewerLiveSettingsParams {
 	chatId: string;
 	storySlug: string;
-	shareId?: string;
+	enabled?: boolean;
 }
 
-export const useStoryViewerLiveSettings = ({ chatId, storySlug, shareId }: UseStoryViewerLiveSettingsParams) => {
+export const useStoryViewerLiveSettings = ({ chatId, storySlug, enabled = true }: UseStoryViewerLiveSettingsParams) => {
 	const queryClient = useQueryClient();
-	const { data } = useQuery(trpc.story.listVersions.queryOptions({ chatId, storySlug }));
+	const { data } = useQuery({ ...trpc.story.listVersions.queryOptions({ chatId, storySlug }), enabled });
 
 	const storyId = data?.id ?? null;
 	const isLive = data?.isLive ?? false;
@@ -18,14 +19,16 @@ export const useStoryViewerLiveSettings = ({ chatId, storySlug, shareId }: UseSt
 	const cacheSchedule = data?.cacheSchedule ?? null;
 	const cacheScheduleDescription = data?.cacheScheduleDescription ?? null;
 
-	const invalidateSharedStory = async () => {
-		if (!shareId) {
-			return;
-		}
-		await queryClient.invalidateQueries({
-			queryKey: trpc.storyShare.get.queryKey({ shareId }),
-		});
-	};
+	const invalidateCustomStory = () =>
+		Promise.all([
+			queryClient.invalidateQueries({ queryKey: trpc.story.getCustomVersion.queryKey({ chatId, storySlug }) }),
+			queryClient.invalidateQueries({
+				queryKey: trpc.story.getCustomStoryQueryData.queryKey({ chatId, storySlug }),
+			}),
+			queryClient.invalidateQueries({
+				queryKey: trpc.story.getCustomStoryNarratives.queryKey({ chatId, storySlug }),
+			}),
+		]);
 
 	const updateLiveSettingsMutation = useMutation(
 		trpc.story.updateLiveSettings.mutationOptions({
@@ -37,7 +40,7 @@ export const useStoryViewerLiveSettings = ({ chatId, storySlug, shareId }: UseSt
 					queryClient.invalidateQueries({
 						queryKey: trpc.story.getLatest.queryKey({ chatId, storySlug }),
 					}),
-					invalidateSharedStory(),
+					invalidateCustomStory(),
 				]);
 			},
 		}),
@@ -56,7 +59,7 @@ export const useStoryViewerLiveSettings = ({ chatId, storySlug, shareId }: UseSt
 					queryClient.invalidateQueries({
 						queryKey: trpc.automation.feed.queryKey(),
 					}),
-					invalidateSharedStory(),
+					invalidateCustomStory(),
 				];
 				if (storyId) {
 					invalidations.push(
@@ -71,13 +74,13 @@ export const useStoryViewerLiveSettings = ({ chatId, storySlug, shareId }: UseSt
 	);
 
 	const handleSaveSettings = useCallback(
-		(settings: {
+		async (settings: {
 			isLive: boolean;
 			isLiveTextDynamic: boolean;
 			cacheSchedule: string | null;
 			cacheScheduleDescription: string | null;
 		}) => {
-			updateLiveSettingsMutation.mutate({ chatId, storySlug, ...settings });
+			await updateLiveSettingsMutation.mutateAsync({ chatId, storySlug, ...settings });
 		},
 		[chatId, storySlug, updateLiveSettingsMutation],
 	);
@@ -85,6 +88,7 @@ export const useStoryViewerLiveSettings = ({ chatId, storySlug, shareId }: UseSt
 	const handleRefreshData = useCallback(() => {
 		refreshDataMutation.mutate({ chatId, storySlug });
 	}, [chatId, storySlug, refreshDataMutation]);
+	const isRefreshing = useIsStoryRefreshing(trpc.story.refreshData.mutationKey(), { chatId, storySlug });
 
 	return {
 		storyId,
@@ -93,7 +97,7 @@ export const useStoryViewerLiveSettings = ({ chatId, storySlug, shareId }: UseSt
 		cacheSchedule,
 		cacheScheduleDescription,
 		isUpdating: updateLiveSettingsMutation.isPending,
-		isRefreshing: refreshDataMutation.isPending,
+		isRefreshing,
 		handleSaveSettings,
 		handleRefreshData,
 	};
