@@ -260,6 +260,11 @@ provision() {
     step "Addon PostgreSQL ($PG_PLAN)"
     sc addons-add postgresql "$PG_PLAN" || info "addon déjà présent, on continue"
   fi
+
+  # Taille posée AVANT le 1er déploiement : en M (défaut Scalingo), backend bun + workers uvicorn
+  # dépassent la mémoire et le conteneur est tué au boot (crashed-error).
+  step "Taille du conteneur web ($WEB_SIZE)"
+  sc scale "web:1:$WEB_SIZE"
 }
 
 # Construit ENV_ARGS (create only). Reprend les valeurs inline, sinon celles déjà sur l'app.
