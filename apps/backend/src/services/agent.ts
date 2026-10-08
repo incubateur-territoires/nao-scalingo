@@ -2,13 +2,12 @@ import type { CustomBoundarySet } from '@nao/shared';
 import { fileExtension } from '@nao/shared/attachments';
 import { markSupersededExecuteSqlParts } from '@nao/shared/execute-sql-parts';
 import { story } from '@nao/shared/tools';
-import type { LlmProvider, LlmSelectedModel } from '@nao/shared/types';
+import type { CitationData, LlmProvider, LlmSelectedModel } from '@nao/shared/types';
 import {
 	convertToModelMessages,
 	createUIMessageStream,
 	FinishReason,
 	generateText,
-	hasToolCall,
 	InferUIMessageChunk,
 	isToolUIPart,
 	ModelMessage,
@@ -21,6 +20,7 @@ import {
 } from 'ai';
 
 import { disableModelReasoning, fitThinkingBudget, getProviderMeta, ProviderModelResult } from '../agents/providers';
+import { interactiveStopConditions } from '../agents/stop-conditions';
 import { getSystemPromptOverride, hasNaoPromptPlaceholder, injectNaoPrompt } from '../agents/system-prompts';
 import { llmTelemetry } from '../agents/telemetry';
 import { getTools } from '../agents/tools';
@@ -28,6 +28,7 @@ import { createWebSearchTools } from '../agents/tools/web-search';
 import { getConnections, getTableColumnsContent, getUserRules } from '../agents/user-rules';
 import { ChatForkContextPrompt, MessagingProviderSystemPrompt, SystemPrompt } from '../components/ai';
 import { DBChat } from '../db/abstractSchema';
+import { env } from '../env';
 import { renderToMarkdown } from '../lib/markdown';
 import * as chatQueries from '../queries/chat.queries';
 import * as imageQueries from '../queries/image.queries';
@@ -64,6 +65,7 @@ import {
 	resolveProviderSettings,
 } from '../utils/llm';
 import { logger } from '../utils/logger';
+import { sanitizeToolCallIds } from '../utils/model-message';
 import { extractConfiguredDatabases, readProjectContext } from '../utils/nao-config';
 import { addPromptCache, cachedSystemInstructions } from '../utils/prompt-cache';
 import { scheduleSaveLlmInferenceRecord } from '../utils/schedule-task';
@@ -71,14 +73,18 @@ import { sanitizeTitle, TITLE_MAX_OUTPUT_TOKENS, titleFromPrompt, titleGeneratio
 import { isStoragePath } from '../utils/tools';
 import { formatErrorMessageForUI, truncateMiddle } from '../utils/utils';
 import { listChartPlugins } from './chart-plugin';
+import { assertProjectCloudBillingAccess } from './cloud-billing-access.service';
 import { compactionService } from './compaction';
 import { hasFeature, LICENSE_FEATURES } from './license.service';
 import { mcpService } from './mcp';
 import { memoryService } from './memory';
 import { getAzureAccessTokenForUser } from './microsoft-auth.service';
+import { sandboxSecretService } from './sandbox-secret.service';
 import { resolveSemanticLayerMode } from './semantic-layer.service';
 import { skillService } from './skill';
+import { isStorageEnabled } from './storage';
 import { canGrepUserFiles } from './storage/user-files';
+import { customStoryAuthoringError } from './story-mount';
 import { getStoryTemplateWarnings } from './story-template-validation';
 import { resolveProjectContextAccess } from './user-group-context-access.service';
 import {
@@ -109,7 +115,6 @@ export interface AgentRunResult {
 
 export type AgentChat = Pick<DBChat, 'id' | 'projectId' | 'userId'> & {
 	forkMetadata?: ForkMetadata | null;
-	testMode?: boolean;
 };
 
 /** Dependencies a tool resolver receives once a run's context has been resolved. */
@@ -126,33 +131,43 @@ export interface AgentToolsContext {
 /** Builds the tool set a run should expose. Callers pass one to `create` to customise tools. */
 export type AgentToolsResolver = (context: AgentToolsContext) => AgentTools | Promise<AgentTools>;
 
-export function shouldAddStoryMode(mentions: Mention[] | undefined, access: AgentUserGroupAccess): boolean {
-	return access.features.storyCreation && Boolean(mentions?.some((mention) => mention.id === story.MENTION_ID));
+export function resolveStoryMode(
+	mentions: Mention[] | undefined,
+	access: AgentUserGroupAccess,
+): 'classic' | 'custom' | null {
+	if (!access.features.storyCreation) {
+		return null;
+	}
+	const mentioned = (id: string) => Boolean(mentions?.some((mention) => mention.id === id));
+	if (env.BETA_CUSTOM_STORIES_ENABLED && access.features.customStoryCreation && mentioned(story.CUSTOM_MENTION_ID)) {
+		return 'custom';
+	}
+	return mentioned(story.MENTION_ID) ? 'classic' : null;
 }
 
+const STORY_MODE_INSTRUCTIONS = {
+	classic:
+		'[Story mode: present your response as an interactive nao Story using the story tool (format "classic"), combining markdown and charts]',
+	custom: '[Custom story mode: present your response as a custom story: call the story tool with format "custom" and build the app with @nao/story-kit blocks]',
+} as const;
+
 /** Default tool set for interactive runs: all built-ins, MCP tools and web search. */
-export const defaultAgentTools: AgentToolsResolver = ({
-	chat,
-	agentSettings,
-	toolContext,
-	webTools,
-	customBoundaries,
-}) =>
+export const defaultAgentTools: AgentToolsResolver = ({ agentSettings, toolContext, webTools, customBoundaries }) =>
 	getTools(agentSettings, webTools ?? {}, {
-		testMode: chat.testMode,
 		customBoundaries,
 		semanticLayerMode: toolContext.semanticLayerMode,
+		customStoryAuthoring: customStoryAuthoringError(toolContext.userGroupFeatures) === null,
 	});
 
 /** Default tool set minus the given built-ins — for runs whose surface cannot render them. */
 export const defaultAgentToolsExcluding =
 	(excludeBuiltinTools: string[]): AgentToolsResolver =>
-	({ chat, agentSettings, toolContext, webTools, customBoundaries }) =>
+	({ agentSettings, toolContext, webTools, customBoundaries }) =>
 		getTools(agentSettings, webTools ?? {}, {
-			testMode: chat.testMode,
 			excludeBuiltinTools,
 			customBoundaries,
 			semanticLayerMode: toolContext.semanticLayerMode,
+			customStoryAuthoring: customStoryAuthoringError(toolContext.userGroupFeatures) === null,
 		});
 
 /**
@@ -160,12 +175,11 @@ export const defaultAgentToolsExcluding =
  * runs against nao's own app database when `ToolContext.adminMode` is set),
  * plus charting and follow-ups. Excludes the filesystem context tools.
  */
-export const adminAgentTools: AgentToolsResolver = ({ chat, agentSettings }) =>
+export const adminAgentTools: AgentToolsResolver = ({ agentSettings }) =>
 	getTools(
 		agentSettings,
 		{},
 		{
-			testMode: chat.testMode,
 			builtinToolAllowlist: [
 				'execute_sql',
 				'read_query_result',
@@ -236,6 +250,7 @@ async function _buildContextBase(opts: {
 		warehouseTableAccess: contextAccess.warehouseTableAccess,
 		warehouseRowSecurity: contextAccess.warehouseRowSecurity,
 		docsContextAccess: contextAccess.docsContextAccess,
+		filesContextAccess: contextAccess.filesContextAccess,
 		userGroupFeatures: contextAccess.userGroupFeatures,
 		userRulesGroupAccess: contextAccess.userRulesGroupAccess,
 		azureAccessToken,
@@ -294,8 +309,12 @@ export class AgentService {
 			adminMode?: boolean;
 			/** Enables project-defined charts that render only in the web client. */
 			supportsCustomCharts?: boolean;
+			billingAccessVerifiedProjectId?: string;
 		} = {},
 	): Promise<AgentManager> {
+		if (options.billingAccessVerifiedProjectId !== chat.projectId) {
+			await assertProjectCloudBillingAccess(chat.projectId);
+		}
 		this._disposeAgent(chat.id);
 		const resolvedLlmSelectedModel = await this._getResolvedLlmSelectedModel(chat.projectId, modelSelection);
 		await assertBudgetNotExceeded(chat.projectId, resolvedLlmSelectedModel.provider, chat.userId);
@@ -320,9 +339,7 @@ export class AgentService {
 		const agentTools = resolvedTools;
 		const stopWhen: StopCondition<AgentTools>[] = options.excludeFollowUps
 			? [stepCountIs(options.maxSteps ?? 20)]
-			: chat.testMode
-				? [hasToolCall('suggest_follow_ups')]
-				: [hasToolCall('suggest_follow_ups'), hasToolCall('clarification')];
+			: interactiveStopConditions;
 		const agent = new AgentManager(
 			chat,
 			modelConfig,
@@ -416,7 +433,7 @@ class AgentManager {
 		private readonly _agentTools: AgentTools,
 		private readonly _toolContext: ToolContext,
 		private readonly _userGroupAccess: AgentUserGroupAccess,
-		stopWhen: StopCondition<AgentTools>[] = [hasToolCall('suggest_follow_ups'), hasToolCall('clarification')],
+		stopWhen: StopCondition<AgentTools>[] = interactiveStopConditions,
 		private readonly _systemPromptOverride?: string,
 	) {
 		this._finished = new Promise((resolve) => {
@@ -588,6 +605,7 @@ class AgentManager {
 					await chatQueries.upsertMessage({
 						...settledMessage,
 						chatId: this.chat.id,
+						senderUserId: this.chat.userId,
 						source: this._toolContext.adminMode ? 'admin' : settledMessage.source,
 						stopReason,
 						error,
@@ -632,7 +650,7 @@ class AgentManager {
 			tools: this._agentTools,
 		});
 
-		return modelMessages;
+		return sanitizeToolCallIds(modelMessages, this._modelSelection.provider);
 	}
 
 	private async _buildSystemPrompt(provider?: Provider, timezone?: string, chatUrl?: string): Promise<string> {
@@ -656,7 +674,13 @@ class AgentManager {
 		const customCharts = this._toolContext.supportsCustomCharts
 			? listChartPlugins(this._toolContext.projectFolder)
 			: [];
-		const mcpServers = await mcpService.getEnabledServers(this.chat.projectId);
+		const toolNames = Object.keys(this._agentTools);
+		const [mcpServers, sandboxSecrets] = await Promise.all([
+			mcpService.getEnabledServers(this.chat.projectId),
+			toolNames.includes('execute_sandboxed_code')
+				? sandboxSecretService.safeListDefinitions(this.chat.userId, this.chat.projectId)
+				: Promise.resolve([]),
+		]);
 		const basePrompt = renderToMarkdown(
 			SystemPrompt({
 				memories,
@@ -666,14 +690,18 @@ class AgentManager {
 				skills,
 				customCharts,
 				mcpServers,
+				sandboxSecrets,
 				semanticLayerMode: this._toolContext.semanticLayerMode,
 				templates,
 				repoNames,
 				contextPresence,
 				timezone,
-				testMode: this.chat.testMode,
-				toolNames: Object.keys(this._agentTools),
-				options: { canGrepSavedFiles: canGrepUserFiles() },
+				toolNames,
+				options: {
+					savedFilesEnabled: isStorageEnabled(),
+					canGrepSavedFiles: canGrepUserFiles(),
+					customStoriesEnabled: customStoryAuthoringError(this._toolContext.userGroupFeatures) === null,
+				},
 			}),
 		);
 		const renderedPrompt = provider
@@ -948,19 +976,17 @@ class AgentManager {
 			return messages;
 		}
 
-		const { start, end, text: citationText } = lastUserMessage.citation;
-		const context = `[The user is referring to the following text selection (chars ${start}–${end}):\n"${citationText}"]`;
+		const context = describeCitation(lastUserMessage.citation);
 		return this._transformLastUserMessageText(messages, (text) => (text ? `${context}\n\n${text}` : context));
 	}
 
 	private _addStoryMode(messages: UIMessage[], mentions?: Mention[]): UIMessage[] {
-		if (!shouldAddStoryMode(mentions, this._userGroupAccess)) {
+		const mode = resolveStoryMode(mentions, this._userGroupAccess);
+		if (!mode) {
 			return messages;
 		}
-
-		const STORY_INSTRUCTION =
-			'[Story mode: present your response as an interactive nao Story using the story tool, combining markdown and charts]';
-		return this._transformLastUserMessageText(messages, (text) => `${STORY_INSTRUCTION}\n\n${text}`);
+		const instruction = STORY_MODE_INSTRUCTIONS[mode];
+		return this._transformLastUserMessageText(messages, (text) => `${instruction}\n\n${text}`);
 	}
 
 	private _addSkills(messages: UIMessage[], mentions?: Mention[]): UIMessage[] {
@@ -1133,6 +1159,15 @@ function describeStoredAttachment(part: { url: string; mediaType: string; filena
 			: '';
 
 	return `[The user attached ${name} (${part.mediaType}) to this message. It is saved at ${part.url}. Its contents are not included here: read that path when you need them.${workbookHint}]`;
+}
+
+function describeCitation({ start, end, text, storySlug, block }: CitationData): string {
+	if (!block) {
+		return `[The user is referring to the following text selection (chars ${start}–${end}):\n"${text}"]`;
+	}
+	const title = block.title ? ` "${block.title}"` : '';
+	const query = block.queryId ? `, reading ${block.queryId}` : '';
+	return `[The user is referring to the ${block.kind} block${title}${query} of the custom story "${storySlug}". Apply their request to that block in the story's source and publish again.]`;
 }
 
 // Singleton instance of the agent service

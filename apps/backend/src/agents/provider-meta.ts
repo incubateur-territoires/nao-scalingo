@@ -11,6 +11,7 @@ import {
 	type ReasoningEffort,
 	safetyThresholdSchema,
 	type ServiceTier,
+	thinkingDisplaySchema,
 } from '../types/llm';
 
 /**
@@ -81,6 +82,7 @@ const BEDROCK_TIERS: ServiceTier[] = ['default', 'reserved', 'priority', 'flex']
 const MINIMAX_TIERS: ServiceTier[] = ['standard', 'priority'];
 
 const ANTHROPIC_EXTRAS: ExtraParamKey[] = ['parallelToolCalls', 'sendReasoning', 'speed', 'inferenceGeo'];
+const ANTHROPIC_ADAPTIVE_EXTRAS: ExtraParamKey[] = [...ANTHROPIC_EXTRAS, 'thinkingDisplay'];
 /**
  * Claude on Vertex: `speed` (fast mode) and `inferenceGeo` are Anthropic-first-party request
  * fields that Vertex's endpoint rejects. `sendReasoning` is an SDK-side prompt transform and
@@ -108,7 +110,17 @@ const ANTHROPIC_ADAPTIVE: ModelCapabilities = {
 	maxOutputTokens: true,
 	effortOptions: CLAUDE_EFFORTS,
 	temperatureMax: 1,
-	extraParams: ANTHROPIC_EXTRAS,
+	extraParams: ANTHROPIC_ADAPTIVE_EXTRAS,
+};
+/** Claude 4.7/4.8: thinking is off by default and its text hidden; progress updates between tool calls are available on request. */
+const ANTHROPIC_HIDDEN_THINKING: ModelCapabilities = {
+	...ANTHROPIC_ADAPTIVE,
+	thinkingDisplay: 'updates',
+};
+/** Claude 5+: thinking is always on with hidden text, and the final prose before a tool call arrives as a progress update. */
+const ANTHROPIC_ALWAYS_THINKING: ModelCapabilities = {
+	...ANTHROPIC_HIDDEN_THINKING,
+	thinkingAlwaysOn: true,
 };
 /** Legacy Claude (4-5 era): extended thinking with an explicit token budget; still accepts topK. */
 const ANTHROPIC_BUDGET: ModelCapabilities = {
@@ -142,7 +154,7 @@ const OPENAI_REASONING_CUSTOM: ModelCapabilities = {
 	...OPENAI_REASONING,
 	effortOptions: undefined,
 };
-/** GPT-5.6 (Sol/Terra/Luna): same surface as GPT-5.x, on the wider none…max effort scale. */
+/** GPT-5.6 (Sol/Terra/Luna) and GPT-6 (Astra/Sol/Luna): same surface as GPT-5.x, on the wider none…max effort scale. */
 const OPENAI_5_6_REASONING: ModelCapabilities = {
 	...OPENAI_REASONING,
 	effortOptions: OPENAI_5_6_EFFORTS,
@@ -329,28 +341,50 @@ export const PROVIDER_META: ProviderMetaMap = {
 				name: 'Claude Fable 5',
 				contextWindow: 300_000,
 				costPerM: { inputNoCache: 10, inputCacheRead: 1, inputCacheWrite: 12.5, output: 50 },
-				capabilities: ANTHROPIC_ADAPTIVE,
+				capabilities: ANTHROPIC_ALWAYS_THINKING,
+			},
+			{
+				id: 'claude-fable-5-1',
+				name: 'Claude Fable 5.1',
+				contextWindow: 300_000,
+				costPerM: { inputNoCache: 10, inputCacheRead: 0.25, inputCacheWrite: 12.5, output: 50 },
+				capabilities: ANTHROPIC_ALWAYS_THINKING,
+			},
+			{
+				id: 'claude-opus-5-5',
+				name: 'Claude Opus 5.5',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 4, inputCacheRead: 0.2, inputCacheWrite: 5, output: 20 },
+				capabilities: ANTHROPIC_ALWAYS_THINKING,
+			},
+			{
+				id: 'claude-sonnet-5',
+				name: 'Claude Sonnet 5',
+				default: true,
+				contextWindow: 200_000,
+				costPerM: { inputNoCache: 2, inputCacheRead: 0.2, inputCacheWrite: 2.5, output: 10 },
+				capabilities: ANTHROPIC_ALWAYS_THINKING,
 			},
 			{
 				id: 'claude-opus-5',
 				name: 'Claude Opus 5',
 				contextWindow: 1_000_000,
 				costPerM: { inputNoCache: 5, inputCacheRead: 0.5, inputCacheWrite: 6.25, output: 25 },
-				capabilities: ANTHROPIC_ADAPTIVE,
+				capabilities: ANTHROPIC_ALWAYS_THINKING,
 			},
 			{
 				id: 'claude-opus-4-8',
 				name: 'Claude Opus 4.8',
 				contextWindow: 200_000,
 				costPerM: { inputNoCache: 5, inputCacheRead: 0.5, inputCacheWrite: 6.25, output: 25 },
-				capabilities: ANTHROPIC_ADAPTIVE,
+				capabilities: ANTHROPIC_HIDDEN_THINKING,
 			},
 			{
 				id: 'claude-opus-4-7',
 				name: 'Claude Opus 4.7',
 				contextWindow: 200_000,
 				costPerM: { inputNoCache: 5, inputCacheRead: 0.5, inputCacheWrite: 6.25, output: 25 },
-				capabilities: ANTHROPIC_ADAPTIVE,
+				capabilities: ANTHROPIC_HIDDEN_THINKING,
 			},
 			{
 				id: 'claude-sonnet-4-6',
@@ -398,6 +432,28 @@ export const PROVIDER_META: ProviderMetaMap = {
 		summaryModelId: 'gpt-4.1-mini',
 		models: [
 			{
+				id: 'gpt-6-astra',
+				name: 'GPT 6 Astra',
+				contextWindow: 1_050_000,
+				costPerM: { inputNoCache: 10, inputCacheRead: 1, inputCacheWrite: 12.5, output: 50 },
+				capabilities: OPENAI_5_6_REASONING,
+			},
+			{
+				id: 'gpt-6-sol',
+				name: 'GPT 6 Sol',
+				default: true,
+				contextWindow: 1_050_000,
+				costPerM: { inputNoCache: 2, inputCacheRead: 0.2, inputCacheWrite: 2.5, output: 10 },
+				capabilities: OPENAI_5_6_REASONING,
+			},
+			{
+				id: 'gpt-6-luna',
+				name: 'GPT 6 Luna',
+				contextWindow: 1_050_000,
+				costPerM: { inputNoCache: 0.1, inputCacheRead: 0.01, inputCacheWrite: 0.125, output: 0.5 },
+				capabilities: OPENAI_5_6_REASONING,
+			},
+			{
 				id: 'gpt-5.6-sol',
 				name: 'GPT 5.6 Sol',
 				contextWindow: 1_050_000,
@@ -422,7 +478,6 @@ export const PROVIDER_META: ProviderMetaMap = {
 			{
 				id: 'gpt-5.5',
 				name: 'GPT 5.5',
-				default: true,
 				contextWindow: 400_000,
 				costPerM: { inputNoCache: 5, inputCacheRead: 0.5, inputCacheWrite: 0, output: 30 },
 				capabilities: OPENAI_REASONING,
@@ -502,6 +557,13 @@ export const PROVIDER_META: ProviderMetaMap = {
 		extractorModelId: 'mistral-medium-latest',
 		summaryModelId: 'mistral-medium-latest',
 		models: [
+			{
+				id: 'mistral-large-4',
+				name: 'Mistral Large 4',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 1.36, inputCacheRead: 0.14, inputCacheWrite: 0, output: 4.18 },
+				capabilities: MISTRAL_SAMPLING,
+			},
 			{
 				id: 'mistral-medium-latest',
 				name: 'Mistral Medium 3.1',
@@ -643,6 +705,48 @@ export const PROVIDER_META: ProviderMetaMap = {
 		extractorModelId: 'anthropic.claude-sonnet-4-6',
 		summaryModelId: 'anthropic.claude-sonnet-4-6',
 		models: [
+			{
+				id: 'global.anthropic.claude-opus-5-5',
+				name: 'Claude Opus 5.5 (Bedrock Global)',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 4, inputCacheRead: 0.2, inputCacheWrite: 5, output: 20 },
+				capabilities: BEDROCK_ADAPTIVE,
+			},
+			{
+				id: 'us.anthropic.claude-opus-5-5',
+				name: 'Claude Opus 5.5 (Bedrock US)',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 4, inputCacheRead: 0.2, inputCacheWrite: 5, output: 20 },
+				capabilities: BEDROCK_ADAPTIVE,
+			},
+			{
+				id: 'global.anthropic.claude-sonnet-5-5',
+				name: 'Claude Sonnet 5.5 (Bedrock Global)',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 2, inputCacheRead: 0.2, inputCacheWrite: 2.5, output: 10 },
+				capabilities: BEDROCK_ADAPTIVE,
+			},
+			{
+				id: 'us.anthropic.claude-sonnet-5-5',
+				name: 'Claude Sonnet 5.5 (Bedrock US)',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 2, inputCacheRead: 0.2, inputCacheWrite: 2.5, output: 10 },
+				capabilities: BEDROCK_ADAPTIVE,
+			},
+			{
+				id: 'global.anthropic.claude-sonnet-5',
+				name: 'Claude Sonnet 5 (Bedrock Global)',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 2, inputCacheRead: 0.2, inputCacheWrite: 2.5, output: 10 },
+				capabilities: BEDROCK_ADAPTIVE,
+			},
+			{
+				id: 'us.anthropic.claude-sonnet-5',
+				name: 'Claude Sonnet 5 (Bedrock US)',
+				contextWindow: 1_000_000,
+				costPerM: { inputNoCache: 2, inputCacheRead: 0.2, inputCacheWrite: 2.5, output: 10 },
+				capabilities: BEDROCK_ADAPTIVE,
+			},
 			{
 				id: 'us.anthropic.claude-sonnet-4-6',
 				name: 'Claude Sonnet 4.6 (Bedrock US)',
@@ -1080,6 +1184,8 @@ function buildExtraParamControl(key: ExtraParamKey, caps: ModelCapabilities): Pa
 			return { key, kind: 'select', label: 'Inference geography', options: ['us', 'global'] };
 		case 'sendReasoning':
 			return { key, kind: 'boolean', label: 'Send reasoning back' };
+		case 'thinkingDisplay':
+			return { key, kind: 'select', label: 'Thinking display', options: thinkingDisplaySchema.options };
 		case 'includeThoughts':
 			return { key, kind: 'boolean', label: 'Include thoughts' };
 		case 'safetyThreshold':

@@ -1,6 +1,7 @@
 import {
 	ALL_DATABASE_CONTEXT_ACCESS,
 	ALL_DOCS_CONTEXT_ACCESS,
+	ALL_FILES_CONTEXT_ACCESS,
 	type BackgroundModelSettings,
 	type CustomBoundarySet,
 	DEFAULT_TOOL_CALL_DENSITY_POLICY,
@@ -71,10 +72,14 @@ export const setProjectMemoryEnabled = async (projectId: string, memoryEnabled: 
 	await updateAgentSettings(projectId, { memoryEnabled });
 };
 
-export const createProject = async (project: NewProject, transaction?: DBTransaction): Promise<DBProject> =>
-	transaction
+export const createProject = async (project: NewProject, transaction?: DBTransaction): Promise<DBProject> => {
+	if (isCloud && !project.orgId) {
+		throw new Error('Cloud projects must belong to an organization.');
+	}
+	return transaction
 		? createProjectWithDefaultGroup(project, transaction)
 		: db.transaction((tx) => createProjectWithDefaultGroup(project, tx));
+};
 
 export const getProjectMember = async (projectId: string, userId: string): Promise<DBProjectMember | null> => {
 	const [member] = await db
@@ -453,7 +458,11 @@ const defaultUserGroupValues = (projectId: string) => ({
 	name: DEFAULT_USER_GROUP_NAME,
 	isDefault: true,
 	featureGrants: serializeUserGroupConfig(USER_GROUP_FEATURES, DEFAULT_TOOL_CALL_DENSITY_POLICY),
-	contextGrants: serializeUserGroupContextAccess(ALL_DATABASE_CONTEXT_ACCESS, ALL_DOCS_CONTEXT_ACCESS),
+	contextGrants: serializeUserGroupContextAccess(
+		ALL_DATABASE_CONTEXT_ACCESS,
+		ALL_DOCS_CONTEXT_ACCESS,
+		ALL_FILES_CONTEXT_ACCESS,
+	),
 });
 
 export const getEnvVars = async (projectId: string): Promise<Record<string, string>> => {
@@ -614,6 +623,14 @@ export const listProjectChats = async (
 				or CAST(${upvotesExpr} AS TEXT) like ${like}
 				or CAST(${toolErrorCountExpr} AS TEXT) like ${like}
 				or CAST(${toolAvailableCountExpr} AS TEXT) like ${like}
+				or exists (
+					select 1
+					from ${s.chatMessage}
+					inner join ${s.messagePart} on ${s.messagePart.messageId} = ${s.chatMessage.id}
+					where ${s.chatMessage.chatId} = ${s.chat.id}
+						and ${s.chatMessage.supersededAt} is null
+						and lower(${s.messagePart.text}) like ${like}
+				)
 			)
 		`);
 	}

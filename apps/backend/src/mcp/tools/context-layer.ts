@@ -1,5 +1,5 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { executeSql, grep, list, readFile } from '@nao/shared/tools';
+import { executeSql, grep, list, LOCAL_DATABASE_ID, readFile } from '@nao/shared/tools';
 import { z } from 'zod';
 import zodV3 from 'zod/v3';
 
@@ -12,15 +12,31 @@ import { upsertMcpQueryData } from '../../queries/mcp-query-data.queries';
 import * as storyQueries from '../../queries/story.queries';
 import * as storyFolderQueries from '../../queries/story-folder.queries';
 import { pinQueryDataToChat, pinStoryMessageToChat } from '../../utils/chat-message-story';
+import type { ConfiguredDatabase } from '../../utils/nao-config';
 import { backfillMissingQueryData, type StoryQueryDataMap } from '../../utils/story-query-data';
 import { STORY_OUTPUT_SCHEMA, type StoryMcpToolPayload } from '../embed/embed-tool-result';
 import { STORY_APP_URI, uiToolMeta } from '../embed/ui-resources';
-import type { McpContext } from '../logging';
+import type { McpContext, ToolResult } from '../logging';
 import { storyChatUrl, storyEmbedUrl, storyUrl } from '../urls';
-import { buildStoryMcpResultWithSandbox, fetchLatestStoryVersion, resolveChartChatId, resolveStory } from './helpers';
+import {
+	CREATE_CUSTOM_STORY_DESCRIPTION,
+	CREATE_CUSTOM_STORY_INPUT,
+	createCustomStoryForMcp,
+	resolveCustomStory,
+	UPDATE_CUSTOM_STORY_DESCRIPTION,
+	UPDATE_CUSTOM_STORY_INPUT,
+	updateCustomStoryForMcp,
+} from './custom-story-mcp';
+import {
+	buildStoryMcpResultWithSandbox,
+	fetchLatestStoryVersion,
+	generateStorySlug,
+	resolveChartChatId,
+	resolveStory,
+} from './helpers';
 import { registerAgentToolAsMcp, registerMcpTool } from './register-mcp-tool';
 
-const EXECUTE_SQL_DESCRIPTION =
+const EXECUTE_SQL_BASE_DESCRIPTION =
 	'Run a single SQL query against the connected warehouse. Read-only unless the workspace admin ' +
 	'has enabled write permissions.\n\n' +
 	'USE WHEN: you already know the SQL (or have a precise question that maps to one query).\n' +
@@ -67,7 +83,7 @@ const UPDATE_STORY_DESCRIPTION =
 
 type ExecuteSqlMcpInput = executeSql.Input & { chat_id?: string };
 
-const EXECUTE_SQL_INPUT_SCHEMA = executeSql.InputSchema.extend({
+const EXECUTE_SQL_BASE_INPUT_SCHEMA = executeSql.InputSchema.extend({
 	chat_id: zodV3
 		.string()
 		.optional()
@@ -77,9 +93,13 @@ const EXECUTE_SQL_INPUT_SCHEMA = executeSql.InputSchema.extend({
 		),
 });
 
-export function registerContextLayerTools(server: McpServer, ctx: McpContext): void {
+export function registerContextLayerTools(
+	server: McpServer,
+	ctx: McpContext,
+	configuredDatabases: ConfiguredDatabase[],
+): void {
 	registerFileTools(server, ctx);
-	registerExecuteSql(server, ctx);
+	registerExecuteSql(server, ctx, configuredDatabases);
 	registerContextStoryTools(server, ctx);
 }
 
@@ -112,13 +132,14 @@ function registerFileTools(server: McpServer, ctx: McpContext): void {
 	});
 }
 
-function registerExecuteSql(server: McpServer, ctx: McpContext): void {
+function registerExecuteSql(server: McpServer, ctx: McpContext, configuredDatabases: ConfiguredDatabase[]): void {
+	const warehouseDatabaseIds = getWarehouseDatabaseIds(configuredDatabases);
 	registerAgentToolAsMcp<executeSql.Input, executeSql.Output, ExecuteSqlMcpInput>(server, ctx, {
 		name: 'execute_sql',
 		agentTool: executeSqlTool,
 		title: 'Execute SQL',
-		description: EXECUTE_SQL_DESCRIPTION,
-		inputSchema: EXECUTE_SQL_INPUT_SCHEMA,
+		description: buildExecuteSqlDescription(warehouseDatabaseIds),
+		inputSchema: buildExecuteSqlInputSchema(warehouseDatabaseIds),
 		outputSchema: executeSql.OutputSchema.extend({
 			query_id: zodV3
 				.string()
@@ -145,12 +166,67 @@ function registerExecuteSql(server: McpServer, ctx: McpContext): void {
 	});
 }
 
+function getWarehouseDatabaseIds(configuredDatabases: ConfiguredDatabase[]): string[] {
+	return [
+		...new Set(
+			configuredDatabases.map((database) => database.id).filter((databaseId) => databaseId !== LOCAL_DATABASE_ID),
+		),
+	];
+}
+
+function buildExecuteSqlDescription(warehouseDatabaseIds: string[]): string {
+	if (warehouseDatabaseIds.length < 2) {
+		return EXECUTE_SQL_BASE_DESCRIPTION;
+	}
+
+	const validDatabaseIds = [...warehouseDatabaseIds, LOCAL_DATABASE_ID];
+	return `${EXECUTE_SQL_BASE_DESCRIPTION}\n\nDatabase selection: \`database_id\` is required because multiple warehouse databases are configured. Valid database IDs: ${formatDatabaseIds(validDatabaseIds)}.`;
+}
+
+function buildExecuteSqlInputSchema(warehouseDatabaseIds: string[]) {
+	if (warehouseDatabaseIds.length < 2) {
+		const validDatabaseIds = new Set([...warehouseDatabaseIds, LOCAL_DATABASE_ID]);
+		const databaseIdSchema = EXECUTE_SQL_BASE_INPUT_SCHEMA.shape.database_id.refine(
+			(databaseId) => databaseId === undefined || validDatabaseIds.has(databaseId),
+			{ message: 'Unknown database_id.' },
+		);
+
+		return EXECUTE_SQL_BASE_INPUT_SCHEMA.extend({
+			database_id: databaseIdSchema,
+		});
+	}
+
+	const validDatabaseIds = [...warehouseDatabaseIds, LOCAL_DATABASE_ID];
+	const missingDatabaseIdMessage = `database_id is required when multiple warehouse databases are configured. Valid database IDs: ${formatDatabaseIds(validDatabaseIds)}.`;
+	const unknownDatabaseIdMessage = `Unknown database_id. Valid database IDs: ${formatDatabaseIds(validDatabaseIds)}.`;
+	const description = `Required because multiple warehouse databases are configured. Valid database IDs: ${formatDatabaseIds(validDatabaseIds)}.`;
+	const databaseIdSchema = zodV3
+		.enum(validDatabaseIds as [string, ...string[]], {
+			errorMap: (issue) => ({
+				message:
+					issue.code === 'invalid_type' && issue.received === 'undefined'
+						? missingDatabaseIdMessage
+						: unknownDatabaseIdMessage,
+			}),
+		})
+		.describe(description);
+
+	return EXECUTE_SQL_BASE_INPUT_SCHEMA.extend({
+		database_id: databaseIdSchema,
+	});
+}
+
+function formatDatabaseIds(databaseIds: string[]): string {
+	return databaseIds.map((databaseId) => `"${databaseId}"`).join(', ');
+}
+
 function registerContextStoryTools(server: McpServer, ctx: McpContext): void {
 	if (ctx.storyCreationEnabled) {
 		registerMcpTool(server, ctx, {
 			name: 'create_story',
 			title: 'Create Story',
-			description: CREATE_STORY_DESCRIPTION,
+			description:
+				CREATE_STORY_DESCRIPTION + (ctx.customStoryCreationEnabled ? CREATE_CUSTOM_STORY_DESCRIPTION : ''),
 			inputSchema: {
 				title: z.string().describe('Story title.'),
 				content: z
@@ -175,31 +251,40 @@ function registerContextStoryTools(server: McpServer, ctx: McpContext): void {
 					.describe(
 						'Attach the story to a chat (e.g. `chatId` from `ask_nao`). Omit for a standalone story. The chat must belong to the calling user.',
 					),
+				...(ctx.customStoryCreationEnabled ? CREATE_CUSTOM_STORY_INPUT : {}),
 			},
 			outputSchema: STORY_OUTPUT_SCHEMA,
 			_meta: uiToolMeta(STORY_APP_URI),
-			handler: async ({ title, content, query_data, chat_id }) => {
-				const slug = generateSlug(title);
+			handler: async ({ title, content, query_data, chat_id, format, files }) => {
+				if (format === 'custom') {
+					if (content !== undefined || query_data !== undefined) {
+						return errorResult('A custom story takes `files`, not `content` or `query_data`.');
+					}
+					return createCustomStoryForMcp({ chatId: chat_id, title, files }, ctx);
+				}
+				if (files !== undefined) {
+					return errorResult('`files` only applies to `format: "custom"`.');
+				}
+				const slug = generateStorySlug(title);
 				const code = content ?? `# ${title}\n`;
 				const story = chat_id
 					? await createChatLinkedStory({ chatId: chat_id, slug, title, code, ctx })
 					: await createStandaloneStory({ slug, title, code, ctx });
 
 				if ('error' in story) {
-					return { content: [{ type: 'text' as const, text: `Error: ${story.error}` }], isError: true };
+					return errorResult(story.error);
 				}
 
 				await cacheStoryQueryData(story.id, code, query_data, chat_id, ctx);
 
-				const storyForUrl = { id: story.id, slug: story.slug, chatId: story.chatId };
 				const embedUrl = storyEmbedUrl(story.id, ctx.projectId);
 				const output: StoryMcpToolPayload = {
 					embedUrl,
 					id: story.id,
 					title: story.title,
 					createdAt: story.createdAt,
-					url: storyUrl(storyForUrl),
-					chatUrl: storyChatUrl(storyForUrl),
+					url: storyUrl(story.id),
+					chatUrl: storyChatUrl(story),
 				};
 				return buildStoryMcpResultWithSandbox(output, ctx, code, story.chatId);
 			},
@@ -209,7 +294,9 @@ function registerContextStoryTools(server: McpServer, ctx: McpContext): void {
 	registerMcpTool(server, ctx, {
 		name: 'update_story',
 		title: 'Update Story',
-		description: UPDATE_STORY_DESCRIPTION,
+		description: ctx.customStoryCreationEnabled
+			? UPDATE_STORY_DESCRIPTION + UPDATE_CUSTOM_STORY_DESCRIPTION
+			: UPDATE_STORY_DESCRIPTION,
 		inputSchema: {
 			story_id: z
 				.string()
@@ -241,11 +328,29 @@ function registerContextStoryTools(server: McpServer, ctx: McpContext): void {
 					'Chat UUID to associate this revision with (e.g. `chatId` from `ask_nao`). ' +
 						"Sets the 'Open in nao' button on the story's embedded charts.",
 				),
+			...(ctx.customStoryCreationEnabled ? UPDATE_CUSTOM_STORY_INPUT : {}),
 		},
 		outputSchema: STORY_OUTPUT_SCHEMA,
 		_meta: uiToolMeta(STORY_APP_URI),
-		handler: async ({ story_id, title, content, query_data, chat_id }) => {
+		handler: async ({ story_id, title, content, query_data, chat_id, files, delete_paths }) => {
+			const customStory = ctx.customStoryCreationEnabled ? await resolveCustomStory(story_id, ctx) : null;
+			if (customStory) {
+				if (content !== undefined || query_data !== undefined) {
+					return errorResult('A custom story is edited with `files` and `delete_paths`, not `content`.');
+				}
+				return updateCustomStoryForMcp(
+					customStory,
+					{ title, files: files ?? [], deletePaths: delete_paths ?? [] },
+					ctx,
+				);
+			}
 			const story = await resolveStory(story_id, ctx);
+			if (story.format === 'custom') {
+				return customStoryUpdateRefusal(story);
+			}
+			if (files !== undefined || delete_paths !== undefined) {
+				return errorResult('`files` and `delete_paths` only apply to custom stories.');
+			}
 			const latestVersion = await fetchLatestStoryVersion(story);
 			const newTitle = title ?? story.title;
 			const newCode = content ?? latestVersion?.code ?? `# ${newTitle}\n`;
@@ -260,12 +365,25 @@ function registerContextStoryTools(server: McpServer, ctx: McpContext): void {
 			const output: StoryMcpToolPayload = {
 				embedUrl,
 				...updated,
-				url: storyUrl(story),
+				url: storyUrl(story.id),
 				chatUrl: storyChatUrl(story),
 			};
 			return buildStoryMcpResultWithSandbox(output, ctx, newCode, effectiveChatId);
 		},
 	});
+}
+
+function customStoryUpdateRefusal(story: storyQueries.UserStoryRow): ToolResult {
+	const chatHint = story.chatId
+		? ` Call \`ask_nao\` with \`chatId\` "${story.chatId}" and describe the change instead.`
+		: '';
+	return errorResult(
+		`"${story.title}" is a custom story (an interactive app), which you cannot edit here.${chatHint}`,
+	);
+}
+
+function errorResult(message: string): ToolResult {
+	return { content: [{ type: 'text' as const, text: `Error: ${message}` }], isError: true };
 }
 
 async function cacheStoryQueryData(
@@ -292,15 +410,6 @@ async function cacheStoryQueryData(
 	if (chatId) {
 		await pinQueryDataToChat(chatId, resolvedQueryData);
 	}
-}
-
-function generateSlug(title: string): string {
-	return (
-		title
-			.toLowerCase()
-			.replace(/[^a-z0-9]+/g, '-')
-			.replace(/^-|-$/g, '') || 'untitled'
-	);
 }
 
 type CreatedStory = { id: string; title: string; slug: string; chatId: string | null; createdAt: Date };

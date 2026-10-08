@@ -248,8 +248,8 @@ def update_version(cli_dir: Path, new_version: str) -> None:
     print(f"✓ Version bumped to {new_version}")
 
 
-#: DuckDB names its binding packages without the NAPI-RS ABI part of the suffix
-DUCKDB_PLATFORM_SUFFIXES = {
+#: DuckDB and sharp name their native packages without the NAPI-RS ABI part of the suffix
+NODE_PLATFORM_SUFFIXES = {
     "darwin-arm64": "darwin-arm64",
     "darwin-x64": "darwin-x64",
     "linux-x64-gnu": "linux-x64",
@@ -287,7 +287,7 @@ def downloadable_native_packages(suffix: str) -> list[tuple[str, str, str]]:
     """
     packages: list[tuple[str, str, str]] = [("sandbox", "sandbox runtime", f"@boxlite-ai/boxlite-{suffix}")]
 
-    duckdb_suffix = DUCKDB_PLATFORM_SUFFIXES.get(suffix)
+    duckdb_suffix = NODE_PLATFORM_SUFFIXES.get(suffix)
     if duckdb_suffix:
         packages.insert(0, ("duckdb", "DuckDB engine", f"@duckdb/node-bindings-{duckdb_suffix}"))
 
@@ -338,8 +338,8 @@ def bundle_native_packages(project_root: Path, output_dir: Path) -> None:
     """Copy native addons into node_modules/ next to the binary.
 
     These packages are externalized from the Bun standalone build because they load
-    platform-specific native files at runtime. Only the small loaders are copied:
-    the DuckDB engine and the sandbox runtime are ~100 MB each and are downloaded
+    platform-specific native files at runtime. Only the small loaders and sharp are
+    copied: the DuckDB engine and the sandbox runtime are ~100 MB each and are downloaded
     on first use instead (see write_native_manifest).
     """
     suffix = get_native_platform_suffix()
@@ -377,6 +377,8 @@ def bundle_native_packages(project_root: Path, output_dir: Path) -> None:
     elif monty_hoisted.exists():
         packages_to_copy.append((monty_platform_pkg, monty_platform_pkg))
 
+    packages_to_copy += [(name, name) for name in sharp_packages(suffix)]
+
     for src_rel, dst_rel in packages_to_copy:
         src = nm_root / src_rel
         dst = out_nm / dst_rel
@@ -388,6 +390,18 @@ def bundle_native_packages(project_root: Path, output_dir: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(src, dst)
         print(f"   {dst_rel}")
+
+
+def sharp_packages(suffix: str) -> list[str]:
+    """sharp with its runtime dependencies, its platform addon and libvips.
+
+    On Windows libvips ships inside the addon package instead of its own package.
+    """
+    node_suffix = NODE_PLATFORM_SUFFIXES[suffix]
+    packages = ["sharp", "@img/colour", "detect-libc", "semver", f"@img/sharp-{node_suffix}"]
+    if sys.platform != "win32":
+        packages.append(f"@img/sharp-libvips-{node_suffix}")
+    return packages
 
 
 def build_server(project_root: Path, output_dir: Path) -> None:
@@ -449,6 +463,17 @@ def build_server(project_root: Path, output_dir: Path) -> None:
     if output_public.exists():
         shutil.rmtree(output_public)
     shutil.copytree(backend_public, output_public)
+
+    # Chart PNG rendering needs the bundled fonts: resvg draws no text without them
+    backend_assets = backend_dir / "assets"
+    output_assets = output_dir / "assets"
+    if output_assets.exists():
+        shutil.rmtree(output_assets)
+    if backend_assets.exists():
+        shutil.copytree(backend_assets, output_assets)
+        print(f"   Assets: {output_assets}")
+    else:
+        print("   ⚠️  No backend assets folder found")
 
     # Step 7: Copy migrations next to the binary (both SQLite and PostgreSQL)
     print("\n📦 Bundling migrations with binary...")
@@ -596,6 +621,7 @@ def build(
     sqlite_migrations_dir = output_dir / "migrations-sqlite"
     postgres_migrations_dir = output_dir / "migrations-postgres"
     fastapi_dir = output_dir / "fastapi"
+    assets_dir = output_dir / "assets"
     rg_binary_name = "rg.exe" if sys.platform == "win32" else "rg"
     rg_path = output_dir / rg_binary_name
 
@@ -613,6 +639,7 @@ def build(
         force
         or not binary_path.exists()
         or not public_dir.exists()
+        or not assets_dir.exists()
         or not sqlite_migrations_dir.exists()
         or not postgres_migrations_dir.exists()
         or not fastapi_dir.exists()
@@ -621,7 +648,8 @@ def build(
     )
 
     if skip_server:
-        if not binary_path.exists() or not public_dir.exists() or not fastapi_dir.exists():
+        required = [binary_path, public_dir, assets_dir, fastapi_dir]
+        if not all(path.exists() for path in required):
             print("❌ Server binary or assets not found. Run without --skip-server first.")
             sys.exit(1)
         print("✓ Skipping server build (--skip-server)")

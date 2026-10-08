@@ -112,6 +112,19 @@ describe('getModelCapabilities', () => {
 		});
 		expect(getModelCapabilities('bedrock', 'meta.llama4')).toMatchObject({ thinking: 'none', sampling: true });
 	});
+
+	it('uses adaptive thinking for Claude 5.x on Bedrock', () => {
+		for (const modelId of [
+			'global.anthropic.claude-opus-5-5',
+			'us.anthropic.claude-opus-5-5',
+			'global.anthropic.claude-sonnet-5-5',
+			'us.anthropic.claude-sonnet-5-5',
+			'global.anthropic.claude-sonnet-5',
+			'us.anthropic.claude-sonnet-5',
+		]) {
+			expect(getModelCapabilities('bedrock', modelId)).toMatchObject({ thinking: 'adaptive', topK: false });
+		}
+	});
 });
 
 describe('getModelParameterSpec', () => {
@@ -131,10 +144,15 @@ describe('getModelParameterSpec', () => {
 			'sendReasoning',
 			'speed',
 			'inferenceGeo',
+			'thinkingDisplay',
 		]);
 		expect(controlByKey(controls, 'reasoningEffort')).toMatchObject({
 			kind: 'effort',
 			options: ['off', 'low', 'medium', 'high', 'max'],
+		});
+		expect(controlByKey(controls, 'thinkingDisplay')).toMatchObject({
+			kind: 'select',
+			options: ['omitted', 'updates', 'summarized'],
 		});
 		expect(controlByKey(controls, 'temperature')).toMatchObject({ max: 1, group: 'sampling' });
 		expect(controlByKey(controls, 'topP')).toMatchObject({ group: 'sampling', exclusiveWith: 'temperature' });

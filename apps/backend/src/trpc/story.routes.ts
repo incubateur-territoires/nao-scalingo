@@ -1,6 +1,7 @@
 import { BULK_ITEMS_LIMIT, NO_CACHE_SCHEDULE } from '@nao/shared';
-import type { BulkStoryItem, UserRole } from '@nao/shared/types';
-import { DOWNLOAD_FORMATS } from '@nao/shared/types';
+import { STORY_KIT_EDITABLE_BLOCKS } from '@nao/shared/story-app';
+import type { BulkStoryItem, NotificationChannel, StoryFormat, UserRole } from '@nao/shared/types';
+import { DOWNLOAD_FORMATS, NOTIFICATION_CHANNELS } from '@nao/shared/types';
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod/v4';
 
@@ -11,10 +12,35 @@ import * as projectQueries from '../queries/project.queries';
 import * as scheduledJobQueries from '../queries/scheduled-job.queries';
 import * as sharedStoryQueries from '../queries/shared-story.queries';
 import * as storyQueries from '../queries/story.queries';
+import * as storyDeliveryQueries from '../queries/story-delivery.queries';
 import * as storyFolderQueries from '../queries/story-folder.queries';
+import { agentService } from '../services/agent';
 import { naturalLanguageToCron } from '../services/cron-nlp';
+import {
+	getCustomStoryFile,
+	getCustomStoryNarratives,
+	getCustomStoryQueryData,
+	getCustomStoryQuerySql,
+	getCustomStoryVersion,
+} from '../services/custom-story';
 import { executeLiveQuery, getStoryQueryData, refreshStoryData } from '../services/live-story';
+import {
+	notifyStoryRefreshed,
+	notifyStoryRefreshFailed,
+	notifyStorySubscriptionAdded,
+} from '../services/notification.service';
 import { nextCronTick } from '../services/scheduler.service';
+import {
+	editCustomStoryBlock,
+	restoreCustomStoryVersion,
+	saveCustomStoryFiles,
+	StoryBlockEditError,
+} from '../services/story-block-edit';
+import {
+	assertValidDeliverySchedule,
+	disableStoryDelivery,
+	syncStoryDeliveryJob,
+} from '../services/story-delivery.service';
 import {
 	assertStoryFiltersEnabled,
 	getFilteredStoryQueryData,
@@ -22,10 +48,21 @@ import {
 	getStoryQuerySql,
 } from '../services/story-filters';
 import { logAnalyticsEvent } from '../utils/analytics-event';
+import { storySnapshotHtml, toCustomStoryQueryTrpcError, toCustomStoryTrpcError } from '../utils/custom-story-trpc';
+import { withKeyedLock } from '../utils/keyed-lock';
+import { logger } from '../utils/logger';
 import { buildDownloadResponse } from '../utils/story-download';
+import { StoryKitJsxEditError } from '../utils/story-kit-jsx';
 import { backfillMissingQueryData } from '../utils/story-query-data';
+import { buildStorySnapshotDownload } from '../utils/story-snapshot';
 import { extractStorySummary } from '../utils/story-summary';
-import { canSendProcedure, ownedResourceProcedure, projectProtectedProcedure, protectedProcedure } from './trpc';
+import {
+	adminProtectedProcedure,
+	canSendProcedure,
+	ownedResourceProcedure,
+	projectProtectedProcedure,
+	protectedProcedure,
+} from './trpc';
 import { assertUserGroupFeatureForTrpc } from './user-group-feature-access';
 
 const chatOwnerProcedure = ownedResourceProcedure(chatQueries.getChatOwnerId, 'chat');
@@ -52,6 +89,8 @@ const storyOwnerProjectProcedure = storyOwnerProcedure.use(async ({ ctx, getRawI
 	}
 	return next();
 });
+
+const storyKitBlockComponent = z.enum(STORY_KIT_EDITABLE_BLOCKS);
 
 const bulkStoryItemsInput = z.object({
 	items: z
@@ -135,6 +174,36 @@ export const storyRoutes = {
 		}));
 	}),
 
+	resolve: protectedProcedure.input(z.object({ storyId: z.string() })).query(async ({ input, ctx }) => {
+		const story = await storyQueries.getStoryById(input.storyId);
+		if (!story) {
+			throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+		}
+		const [ownerId, projectId] = await Promise.all([
+			storyQueries.getStoryOwnerId(story.id),
+			storyQueries.getStoryProjectId(story.id),
+		]);
+		await assertCanOpenStory(story.id, projectId, ctx.user.id);
+		return {
+			storyId: story.id,
+			chatId: story.chatId,
+			slug: story.slug,
+			format: story.format,
+			isOwner: ownerId === ctx.user.id,
+		};
+	}),
+
+	getIdByChatAndSlug: protectedProcedure
+		.input(z.object({ chatId: z.string(), storySlug: z.string() }))
+		.query(async ({ input, ctx }) => {
+			const story = await storyQueries.getStoryByChatAndSlug(input.chatId, input.storySlug);
+			if (!story) {
+				throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+			}
+			await assertCanOpenStory(story.id, await storyQueries.getStoryProjectId(story.id), ctx.user.id);
+			return { storyId: story.id };
+		}),
+
 	getStandalone: storyOwnerProjectProcedure.input(z.object({ storyId: z.string() })).query(async ({ input, ctx }) => {
 		const story = await storyQueries.getStoryByIdForUser(input.storyId, ctx.user.id);
 		if (!story) {
@@ -182,14 +251,15 @@ export const storyRoutes = {
 			if (!version) {
 				throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
 			}
-			const { queryData, cachedAt, code } = await getStoryQueryData(
+			const lastRefreshFailure = await activityQueries.getLatestStoryRefreshFailure(version.storyId);
+			const { queryData, cachedAt, code, needsRefresh } = await getStoryQueryData(
 				input.chatId,
 				input.storySlug,
 				version.code,
 				version.isLive,
 				version.cacheSchedule,
+				{ deferRefresh: lastRefreshFailure !== null, deferFirstRefresh: true },
 			);
-			const lastRefreshFailure = await activityQueries.getLatestStoryRefreshFailure(version.storyId);
 
 			const projectId = await chatQueries.getChatProjectId(input.chatId);
 			if (projectId) {
@@ -204,7 +274,7 @@ export const storyRoutes = {
 				});
 			}
 
-			return { ...version, code, queryData, cachedAt, lastRefreshFailure };
+			return { ...version, code, queryData, cachedAt, lastRefreshFailure, needsRefresh: needsRefresh ?? false };
 		}),
 
 	listVersions: chatStoryProcedure
@@ -215,6 +285,7 @@ export const storyRoutes = {
 				return {
 					id: null as string | null,
 					title: input.storySlug,
+					format: 'classic' as StoryFormat,
 					isLive: false,
 					isLiveTextDynamic: false,
 					cacheSchedule: null as string | null,
@@ -228,6 +299,7 @@ export const storyRoutes = {
 			return {
 				id: story.id as string | null,
 				title: story.title,
+				format: story.format,
 				isLive: story.isLive,
 				isLiveTextDynamic: story.isLiveTextDynamic,
 				cacheSchedule: story.cacheSchedule,
@@ -255,6 +327,201 @@ export const storyRoutes = {
 			return { queryData };
 		}),
 
+	getCustomVersion: chatOwnerProcedure
+		.input(
+			z.object({
+				chatId: z.string(),
+				storySlug: z.string(),
+				versionNumber: z.number().int().positive().optional(),
+			}),
+		)
+		.query(async ({ input }) => {
+			try {
+				return await getCustomStoryVersion(input.chatId, input.storySlug, input.versionNumber);
+			} catch (error) {
+				throw toCustomStoryTrpcError(error);
+			}
+		}),
+
+	getCustomVersionFile: chatOwnerProcedure
+		.input(
+			z.object({
+				chatId: z.string(),
+				storySlug: z.string(),
+				path: z.string(),
+				versionNumber: z.number().int().positive().optional(),
+			}),
+		)
+		.query(async ({ input }) => {
+			try {
+				return await getCustomStoryFile(input.chatId, input.storySlug, input.path, input.versionNumber);
+			} catch (error) {
+				throw toCustomStoryTrpcError(error);
+			}
+		}),
+
+	getCustomStoryQueryData: chatOwnerProcedure
+		.input(z.object({ chatId: z.string(), storySlug: z.string(), queryId: z.string() }))
+		.query(async ({ input }) => {
+			try {
+				return await getCustomStoryQueryData(input.chatId, input.storySlug, input.queryId, {
+					deferRefresh: true,
+				});
+			} catch (error) {
+				throw toCustomStoryQueryTrpcError(error);
+			}
+		}),
+
+	getCustomStoryQuerySql: chatOwnerProcedure
+		.input(z.object({ chatId: z.string(), storySlug: z.string(), queryId: z.string() }))
+		.query(async ({ input }) => {
+			try {
+				return { sqlQuery: await getCustomStoryQuerySql(input.chatId, input.storySlug, input.queryId) };
+			} catch (error) {
+				throw toCustomStoryTrpcError(error);
+			}
+		}),
+
+	getCustomStoryNarratives: chatOwnerProcedure
+		.input(z.object({ chatId: z.string(), storySlug: z.string() }))
+		.query(async ({ input }) => {
+			try {
+				return await getCustomStoryNarratives(input.chatId, input.storySlug, { deferRefresh: true });
+			} catch (error) {
+				throw toCustomStoryTrpcError(error);
+			}
+		}),
+
+	downloadCustom: chatOwnerProcedure
+		.input(
+			z.object({
+				chatId: z.string(),
+				storySlug: z.string(),
+				format: z.enum(DOWNLOAD_FORMATS),
+				html: storySnapshotHtml,
+				versionNumber: z.number().int().positive().optional(),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			const version = input.versionNumber
+				? await storyQueries.getVersionByNumber(input.chatId, input.storySlug, input.versionNumber)
+				: await storyQueries.getLatestVersionByChatAndSlug(input.chatId, input.storySlug);
+			if (!version || version.format !== 'custom') {
+				throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+			}
+
+			const projectId = await chatQueries.getChatProjectId(input.chatId);
+			if (projectId) {
+				logAnalyticsEvent({
+					projectId,
+					type: 'download',
+					assetType: 'story',
+					actorUserId: ctx.user.id,
+					storyId: version.storyId,
+					chatId: input.chatId,
+					metadata: {
+						type: 'download',
+						format: input.format,
+						versionNumber: version.version,
+						title: version.title,
+					},
+				});
+			}
+
+			return buildStorySnapshotDownload(input.format, version.title, input.html);
+		}),
+
+	editCustomStoryBlock: chatOwnerProcedure
+		.input(
+			z.object({
+				chatId: z.string(),
+				storySlug: z.string(),
+				versionNumber: z.number().int().positive(),
+				block: z.object({ component: storyKitBlockComponent, props: z.record(z.string(), z.unknown()) }),
+				change: z.object({
+					component: storyKitBlockComponent.optional(),
+					set: z.record(z.string(), z.unknown()),
+					unset: z.array(z.string()),
+				}),
+			}),
+		)
+		.mutation(async ({ input }) => {
+			if (agentService.get(input.chatId)) {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message: 'The agent is working on this chat. Edit the story once it is done.',
+				});
+			}
+			try {
+				return await editCustomStoryBlock(input);
+			} catch (error) {
+				if (error instanceof StoryBlockEditError || error instanceof StoryKitJsxEditError) {
+					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
+				}
+				throw toCustomStoryTrpcError(error);
+			}
+		}),
+
+	saveCustomStoryFiles: chatOwnerProcedure
+		.input(
+			z.object({
+				chatId: z.string(),
+				storySlug: z.string(),
+				versionNumber: z.number().int().positive(),
+				files: z
+					.array(z.object({ path: z.string(), content: z.string() }))
+					.min(1)
+					.max(60),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			if (agentService.get(input.chatId)) {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message: 'The agent is working on this chat. Save your changes once it is done.',
+				});
+			}
+			const projectId = await chatQueries.getChatProjectId(input.chatId);
+			if (!projectId) {
+				throw new TRPCError({ code: 'NOT_FOUND', message: 'Chat not found.' });
+			}
+			await assertUserGroupFeatureForTrpc(projectId, ctx.user.id, 'customStoryCreation');
+			try {
+				return await saveCustomStoryFiles(input);
+			} catch (error) {
+				if (error instanceof StoryBlockEditError) {
+					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
+				}
+				throw toCustomStoryTrpcError(error);
+			}
+		}),
+
+	restoreCustomVersion: chatOwnerProcedure
+		.input(
+			z.object({
+				chatId: z.string(),
+				storySlug: z.string(),
+				versionNumber: z.number().int().positive(),
+				restoreVersionNumber: z.number().int().positive(),
+			}),
+		)
+		.mutation(async ({ input }) => {
+			if (agentService.get(input.chatId)) {
+				throw new TRPCError({
+					code: 'CONFLICT',
+					message: 'The agent is working on this chat. Restore the version once it is done.',
+				});
+			}
+			try {
+				return await restoreCustomStoryVersion(input);
+			} catch (error) {
+				if (error instanceof StoryBlockEditError) {
+					throw new TRPCError({ code: 'BAD_REQUEST', message: error.message });
+				}
+				throw toCustomStoryTrpcError(error);
+			}
+		}),
+
 	listStories: chatStoryProcedure.input(z.object({ chatId: z.string() })).query(async ({ input }) => {
 		const stories = await storyQueries.listStoriesInChat(input.chatId);
 		return stories.map((s) => ({ storySlug: s.slug, title: s.title, latestVersion: s.latestVersion }));
@@ -264,6 +531,25 @@ export const storyRoutes = {
 		.input(z.object({ storyId: z.string(), title: z.string().trim().min(1).max(255) }))
 		.mutation(async ({ input }) => {
 			await storyQueries.renameStory(input.storyId, input.title);
+		}),
+
+	getCertification: projectProtectedProcedure
+		.input(z.object({ storyId: z.string() }))
+		.query(async ({ input, ctx }) => {
+			await getStoryInProject(input.storyId, ctx.project.id);
+			if (!(await storyQueries.canUserAccessStory(input.storyId, ctx.user.id))) {
+				throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+			}
+			return storyQueries.getStoryCertification(input.storyId);
+		}),
+
+	toggleCertification: adminProtectedProcedure
+		.input(z.object({ storyId: z.string() }))
+		.mutation(async ({ input, ctx }) => {
+			const story = await getStoryInProject(input.storyId, ctx.project.id);
+			const certifiedBy = story.certifiedAt === null ? ctx.user.id : null;
+			const certifiedAt = await storyQueries.setStoryCertification(story.id, certifiedBy);
+			return { certifiedAt };
 		}),
 
 	createVersion: chatStoryProcedure
@@ -324,6 +610,138 @@ export const storyRoutes = {
 				cacheScheduleDescription: input.cacheScheduleDescription,
 			});
 			await syncStoryRefreshJob(input.chatId, input.storySlug, input.isLive, input.cacheSchedule);
+
+			const story = await storyQueries.getStoryByChatAndSlug(input.chatId, input.storySlug);
+			const delivery = story ? await storyDeliveryQueries.getByStoryId(story.id) : null;
+			if (story && delivery) {
+				const deliveryEnabled = input.isLive && delivery.enabled;
+				await syncStoryDeliveryJob(story.id, deliveryEnabled, delivery.cron);
+			}
+		}),
+
+	getDelivery: chatOwnerProcedure
+		.input(z.object({ chatId: z.string(), storySlug: z.string() }))
+		.query(async ({ input }) => {
+			const story = await storyQueries.getStoryByChatAndSlug(input.chatId, input.storySlug);
+			if (!story) {
+				throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+			}
+			const delivery = await storyDeliveryQueries.getByStoryId(story.id);
+			return {
+				enabled: delivery?.enabled ?? false,
+				cron: delivery?.cron ?? null,
+				scheduleDescription: delivery?.scheduleDescription ?? null,
+				channels: delivery?.channels ?? (['email'] as NotificationChannel[]),
+				recipientMode: delivery?.recipientMode ?? 'specific',
+				recipientUserIds: delivery?.recipientUserIds ?? [],
+			};
+		}),
+
+	listDeliveryRecipients: chatOwnerProcedure
+		.input(z.object({ chatId: z.string(), storySlug: z.string() }))
+		.query(async ({ input }) => {
+			const projectId = await chatQueries.getChatProjectId(input.chatId);
+			if (!projectId) {
+				return [];
+			}
+			const story = await storyQueries.getStoryByChatAndSlug(input.chatId, input.storySlug);
+			const access = story ? await sharedStoryQueries.getStoryShareAccess(story.id, projectId) : null;
+			const members = await projectQueries.listProjectMembersWithRoles(projectId);
+			const toRecipient = (member: (typeof members)[number]) => ({
+				id: member.id,
+				name: member.name,
+				email: member.email,
+			});
+
+			if (access?.visibility === 'specific' && access.recipientUserIds.length > 0) {
+				const allowed = new Set(access.recipientUserIds);
+				return members.filter((member) => allowed.has(member.id)).map(toRecipient);
+			}
+			return members.map(toRecipient);
+		}),
+
+	updateDelivery: chatOwnerProcedure
+		.input(
+			z.object({
+				chatId: z.string(),
+				storySlug: z.string(),
+				enabled: z.boolean(),
+				cron: z.string().nullable(),
+				scheduleDescription: z.string().nullable(),
+				channels: z.array(z.enum(NOTIFICATION_CHANNELS)).min(1),
+				recipientMode: z.enum(['all', 'specific']),
+				recipientUserIds: z.array(z.string()),
+			}),
+		)
+		.mutation(async ({ input, ctx }) => {
+			const story = await storyQueries.getStoryByChatAndSlug(input.chatId, input.storySlug);
+			if (!story) {
+				throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+			}
+			if (input.enabled && !story.isLive) {
+				throw new TRPCError({
+					code: 'BAD_REQUEST',
+					message: 'Scheduled delivery is only available for live stories.',
+				});
+			}
+			const projectId = story.projectId ?? (await storyQueries.getStoryProjectId(story.id));
+			assertValidDeliverySchedule(input.enabled, input.cron, input.recipientMode, input.recipientUserIds);
+
+			const existingDelivery = await storyDeliveryQueries.getByStoryId(story.id);
+			const previousRecipientIds = new Set(
+				existingDelivery?.recipientMode === 'specific' ? existingDelivery.recipientUserIds : [],
+			);
+
+			if (input.recipientMode === 'specific' && input.recipientUserIds.length > 0) {
+				if (!projectId) {
+					throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'Story has no project.' });
+				}
+				const allowedIds = new Set(
+					(await projectQueries.listUsersWithProjectAccess(projectId)).map((member) => member.id),
+				);
+				if (input.recipientUserIds.some((id) => !allowedIds.has(id))) {
+					throw new TRPCError({
+						code: 'FORBIDDEN',
+						message: 'Recipients must have access to this project.',
+					});
+				}
+			}
+
+			if (input.enabled && projectId) {
+				const sharedInfo = await sharedStoryQueries.getSharedStoryInfo(story.id, projectId);
+				if (!sharedInfo) {
+					await storyFolderQueries.moveStoryToFolder(story.id, null, {
+						storyOwnerId: ctx.user.id,
+						projectId,
+					});
+				}
+			}
+
+			await storyDeliveryQueries.upsert({
+				storyId: story.id,
+				projectId,
+				enabled: input.enabled,
+				cron: input.cron,
+				scheduleDescription: input.scheduleDescription,
+				channels: input.channels,
+				recipientMode: input.recipientMode,
+				recipientUserIds: input.recipientUserIds,
+				createdBy: ctx.user.id,
+			});
+			await syncStoryDeliveryJob(story.id, input.enabled, input.cron);
+
+			if (input.enabled && input.recipientMode === 'specific' && projectId) {
+				const addedUserIds = input.recipientUserIds.filter(
+					(id) => id !== ctx.user.id && !previousRecipientIds.has(id),
+				);
+				await notifyStorySubscribers(story.id, projectId, ctx.user.name, addedUserIds).catch((error) => {
+					logger.error(`Failed to notify story subscribers: ${String(error)}`, {
+						source: 'system',
+						projectId,
+						context: { storyId: story.id },
+					});
+				});
+			}
 		}),
 
 	refreshData: chatStoryProcedure
@@ -345,23 +763,56 @@ export const storyRoutes = {
 				trigger: 'manual',
 			});
 			try {
-				const { queryData } = await refreshStoryData(input.chatId, input.storySlug);
-				await activityQueries.completeActivity(activity.id, {
-					queriesRefreshed: Object.keys(queryData).length,
+				return await withKeyedLock(`story:${story.id}`, async () => {
+					const { queryData } = await refreshStoryData(input.chatId, input.storySlug);
+					const queriesRefreshed = Object.keys(queryData).length;
+					await activityQueries.completeActivity(activity.id, { queriesRefreshed });
+					await notifyStoryRefreshed({
+						projectId,
+						ownerId: story.userId ?? ctx.user.id,
+						storyId: story.id,
+						storyTitle: story.title,
+						queriesRefreshed,
+						trigger: 'manual',
+					}).catch((notifyError) => {
+						logger.error(`Failed to notify story refresh: ${String(notifyError)}`, {
+							source: 'system',
+							projectId,
+							context: { storyId: story.id },
+						});
+					});
+					logAnalyticsEvent({
+						projectId,
+						type: 'refresh',
+						assetType: 'story',
+						actorUserId: ctx.user.id,
+						storyId: story.id,
+						chatId: story.chatId,
+						metadata: {
+							type: 'refresh',
+							trigger: 'manual',
+							queriesRefreshed: Object.keys(queryData).length,
+						},
+					});
+					return { queryData, cachedAt: new Date() };
 				});
-				logAnalyticsEvent({
-					projectId,
-					type: 'refresh',
-					assetType: 'story',
-					actorUserId: ctx.user.id,
-					storyId: story.id,
-					chatId: story.chatId,
-					metadata: { type: 'refresh', trigger: 'manual', queriesRefreshed: Object.keys(queryData).length },
-				});
-				return { queryData, cachedAt: new Date() };
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				await activityQueries.failActivity(activity.id, message);
+				await notifyStoryRefreshFailed({
+					projectId,
+					ownerId: story.userId ?? ctx.user.id,
+					storyId: story.id,
+					storyTitle: story.title,
+					errorMessage: message,
+					trigger: 'manual',
+				}).catch((notifyError) => {
+					logger.error(`Failed to notify owner of manual refresh failure: ${String(notifyError)}`, {
+						source: 'system',
+						projectId,
+						context: { storyId: story.id },
+					});
+				});
 				throw err;
 			}
 		}),
@@ -417,6 +868,10 @@ export const storyRoutes = {
 		.mutation(async ({ input }) => {
 			await storyQueries.archiveStory(input.chatId, input.storySlug);
 			await syncStoryRefreshJob(input.chatId, input.storySlug, false, null);
+			const story = await storyQueries.getStoryByChatAndSlug(input.chatId, input.storySlug);
+			if (story) {
+				await disableStoryDelivery(story.id);
+			}
 		}),
 
 	unarchive: chatStoryProcedure
@@ -456,6 +911,7 @@ export const storyRoutes = {
 			sharing: {
 				visibility: story.visibility,
 				sharedWithCount: story.sharedWithCount,
+				sharedWithGroupCount: story.sharedWithGroupCount,
 				isPinned: story.isPinned,
 			},
 		}));
@@ -596,6 +1052,22 @@ export const storyRoutes = {
 		}),
 };
 
+async function assertCanOpenStory(storyId: string, projectId: string | null, userId: string): Promise<void> {
+	const userRole = projectId ? await projectQueries.getUserRoleInProject(projectId, userId) : null;
+	if (!userRole || !(await storyQueries.canUserAccessStory(storyId, userId))) {
+		throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+	}
+}
+
+async function getStoryInProject(storyId: string, projectId: string) {
+	const story = await storyQueries.getStoryById(storyId);
+	const storyProjectId = story ? await storyQueries.getStoryProjectId(story.id) : null;
+	if (!story || storyProjectId !== projectId) {
+		throw new TRPCError({ code: 'NOT_FOUND', message: 'Story not found.' });
+	}
+	return story;
+}
+
 async function filterStoriesByProjectAccess(
 	stories: Awaited<ReturnType<typeof storyQueries.listUserChatStories>>,
 	userId: string,
@@ -688,13 +1160,45 @@ async function syncStoryRefreshJob(
 	await activityQueries.linkStoryScheduledJob(story.id, job.id);
 }
 
-async function unscheduleStoryRefreshJob(storyId: string): Promise<void> {
-	const story = await storyQueries.getStoryById(storyId);
-	if (!story?.scheduledJobId) {
+async function notifyStorySubscribers(
+	storyId: string,
+	projectId: string,
+	ownerName: string,
+	addedUserIds: string[],
+): Promise<void> {
+	if (addedUserIds.length === 0) {
 		return;
 	}
-	await scheduledJobQueries.deleteJob(story.scheduledJobId);
-	await activityQueries.linkStoryScheduledJob(storyId, null);
+	const version = await storyQueries.getLatestVersionByStoryId(storyId);
+	if (!version) {
+		return;
+	}
+	await grantSpecificShareAccess(storyId, projectId, addedUserIds);
+	await notifyStorySubscriptionAdded({
+		projectId,
+		storyId,
+		storyTitle: version.title,
+		ownerName,
+		addedUserIds,
+	});
+}
+
+async function grantSpecificShareAccess(storyId: string, projectId: string, userIds: string[]): Promise<void> {
+	const access = await sharedStoryQueries.getStoryShareAccess(storyId, projectId);
+	if (access?.visibility !== 'specific') {
+		return;
+	}
+	const missing = userIds.filter((id) => !access.allowedUserIds.includes(id));
+	await sharedStoryQueries.addSharedStoryAllowedUsers(access.shareId, missing);
+}
+
+async function unscheduleStoryRefreshJob(storyId: string): Promise<void> {
+	const story = await storyQueries.getStoryById(storyId);
+	if (story?.scheduledJobId) {
+		await scheduledJobQueries.deleteJob(story.scheduledJobId);
+		await activityQueries.linkStoryScheduledJob(storyId, null);
+	}
+	await disableStoryDelivery(storyId);
 }
 
 async function assertBulkItemsOwnership(

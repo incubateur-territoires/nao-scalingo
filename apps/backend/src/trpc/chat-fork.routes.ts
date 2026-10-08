@@ -7,6 +7,7 @@ import * as sharedChatQueries from '../queries/shared-chat.queries';
 import * as sharedStoryQueries from '../queries/shared-story.queries';
 import * as storyQueries from '../queries/story.queries';
 import * as storyFolderQueries from '../queries/story-folder.queries';
+import { assertProjectCloudBillingAccess } from '../services/cloud-billing-access.service';
 import { compactionService } from '../services/compaction';
 import type { ForkMetadata, UIMessage, UIMessagePart } from '../types/chat';
 import { logAnalyticsEvent } from '../utils/analytics-event';
@@ -14,8 +15,11 @@ import { buildQueryDataParts, pinStoryMessageToChat } from '../utils/chat-messag
 import { canSendProcedure, projectProtectedProcedure, protectedProcedure } from './trpc';
 import { assertUserGroupFeatureForTrpc } from './user-group-feature-access';
 
-const shareTypeSchema = z.enum(['chat', 'story']);
 const selectionSchema = z.object({ start: z.number(), end: z.number(), text: z.string() });
+const forkSourceSchema = z.discriminatedUnion('type', [
+	z.object({ type: z.literal('chat'), shareId: z.string() }),
+	z.object({ type: z.literal('story'), storyId: z.string() }),
+]);
 
 export interface SelectionInfo {
 	start: number;
@@ -25,18 +29,12 @@ export interface SelectionInfo {
 
 export const chatForkRoutes = {
 	fork: canSendProcedure
-		.input(
-			z.object({
-				shareId: z.string(),
-				type: shareTypeSchema,
-				selection: selectionSchema.optional(),
-			}),
-		)
+		.input(z.object({ source: forkSourceSchema, selection: selectionSchema.optional() }))
 		.mutation(async ({ input, ctx }): Promise<{ chatId: string }> => {
-			if (input.type === 'chat') {
-				return forkSharedChat(input.shareId, input.selection, ctx.user.id);
+			if (input.source.type === 'chat') {
+				return forkSharedChat(input.source.shareId, input.selection, ctx.user.id);
 			}
-			return forkSharedStoryItem(input.shareId, input.selection, ctx.user.id);
+			return forkSharedStoryItem(input.source.storyId, input.selection, ctx.user.id);
 		}),
 
 	openStandalone: projectProtectedProcedure
@@ -49,6 +47,7 @@ export const chatForkRoutes = {
 			if (story.chatId) {
 				return { chatId: story.chatId };
 			}
+			await assertProjectCloudBillingAccess(ctx.project.id);
 
 			const cache = await storyQueries.getStoryDataCacheByStoryId(story.id);
 			const seedMessages = cache?.queryData
@@ -83,13 +82,13 @@ export const chatForkRoutes = {
 		}),
 
 	getSelectionForks: protectedProcedure
-		.input(z.object({ shareId: z.string(), type: shareTypeSchema }))
+		.input(z.object({ source: forkSourceSchema }))
 		.query(async ({ input, ctx }) => {
-			if (input.type === 'story') {
-				await resolveSharedStory(input.shareId, ctx.user.id);
+			if (input.source.type === 'chat') {
+				return chatQueries.getSelectionForksBySourceId(ctx.user.id, input.source.shareId, 'chat_selection');
 			}
-			const forkType = input.type === 'chat' ? 'chat_selection' : 'story_selection';
-			return chatQueries.getSelectionForksByShareId(ctx.user.id, input.shareId, forkType);
+			await resolveSharedStory(input.source.storyId, ctx.user.id);
+			return chatQueries.getSelectionForksBySourceId(ctx.user.id, input.source.storyId, 'story_selection');
 		}),
 };
 
@@ -99,6 +98,7 @@ async function forkSharedChat(
 	userId: string,
 ): Promise<{ chatId: string }> {
 	const share = await resolveSharedChat(shareId, userId);
+	await assertProjectCloudBillingAccess(share.projectId);
 
 	const forkMetadata: ForkMetadata = selection
 		? buildSelectionMetadata('chat_selection', shareId, share.title, share.authorName, selection)
@@ -129,19 +129,20 @@ async function forkSharedChat(
 }
 
 async function forkSharedStoryItem(
-	shareId: string,
+	storyId: string,
 	selection: SelectionInfo | undefined,
 	userId: string,
 ): Promise<{ chatId: string }> {
-	const share = await resolveSharedStory(shareId, userId);
+	const share = await resolveSharedStory(storyId, userId);
 	const projectId = share.projectId;
+	await assertProjectCloudBillingAccess(projectId);
 	if (userId !== share.userId) {
 		await assertUserGroupFeatureForTrpc(projectId, userId, 'storyCreation');
 	}
 
 	const forkMetadata: ForkMetadata = selection
-		? buildSelectionMetadata('story_selection', shareId, share.title, share.authorName, selection)
-		: { type: 'story', id: share.storyId, title: share.title, authorName: share.authorName };
+		? buildSelectionMetadata('story_selection', storyId, share.title, share.authorName, selection)
+		: { type: 'story', id: storyId, title: share.title, authorName: share.authorName };
 
 	if (selection) {
 		const [rawMessages, queryData] = await Promise.all([
@@ -211,8 +212,8 @@ async function resolveSharedChat(shareId: string, userId: string) {
 	return share;
 }
 
-async function resolveSharedStory(shareId: string, userId: string) {
-	const share = await sharedStoryQueries.getSharedStory(shareId);
+async function resolveSharedStory(storyId: string, userId: string) {
+	const share = await sharedStoryQueries.getSharedStoryByStoryId(storyId);
 	if (!share) {
 		throw new TRPCError({ code: 'NOT_FOUND', message: 'Shared story not found.' });
 	}
@@ -231,14 +232,14 @@ async function resolveSharedStory(shareId: string, userId: string) {
 
 function buildSelectionMetadata(
 	type: 'chat_selection' | 'story_selection',
-	shareId: string,
+	sourceId: string,
 	title: string,
 	authorName: string,
 	selection: SelectionInfo,
 ): ForkMetadata {
 	return {
 		type,
-		id: shareId,
+		id: sourceId,
 		title,
 		authorName,
 		selectionStart: selection.start,

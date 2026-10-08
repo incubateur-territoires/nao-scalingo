@@ -28,7 +28,9 @@ import type {
 	ProviderConfigMap,
 	ProviderSettings,
 	ReasoningEffort,
+	ThinkingDisplay,
 } from '../types/llm';
+import { withProgressUpdates } from './anthropic-progress-updates';
 import {
 	DEFAULT_TEMPERATURE_MAX,
 	EFFORT_OPTIONS,
@@ -51,13 +53,16 @@ export {
 	PROVIDER_META,
 } from './provider-meta';
 
+/** Assumed for models missing from the catalogue, such as custom models behind an OpenAI-compatible endpoint. */
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+
 export const CACHE_1H = { type: 'ephemeral', ttl: '1h' } as const;
 export const CACHE_5M = { type: 'ephemeral' } as const;
 
 export const LLM_PROVIDERS: LlmProvidersType = {
 	anthropic: {
 		...PROVIDER_META.anthropic,
-		create: (settings, modelId) => createAnthropic(settings).chat(modelId),
+		create: (settings, modelId) => withProgressUpdates(createAnthropic(settings).chat(modelId)),
 		defaultOptions: {
 			disableParallelToolUse: false,
 			contextManagement: {
@@ -297,7 +302,7 @@ export function createProviderModel(
 	const providerConfig = LLM_PROVIDERS[kind];
 	const defaultOptions = resolveDefaultOptions(provider, modelId, providerConfig.defaultOptions ?? {});
 	const modelConfig = getProviderModelConfig(kind, modelId);
-	const contextWindow = providerConfig.models.find((m) => m.id === modelId)?.contextWindow ?? 200_000;
+	const contextWindow = getContextWindow(provider, modelId);
 
 	const { callSettings, providerOverrides } = resolveInferenceOptions(provider, modelId, inferenceSettings);
 
@@ -314,6 +319,11 @@ export function createProviderModel(
 	};
 }
 
+export function getContextWindow(provider: LlmProvider, modelId: string): number {
+	const models = LLM_PROVIDERS[providerKind(provider)].models;
+	return models.find((m) => m.id === modelId)?.contextWindow ?? DEFAULT_CONTEXT_WINDOW;
+}
+
 function resolveDefaultOptions(provider: LlmProvider, modelId: string, defaultOptions: object): object {
 	if (getModelCapabilities(provider, modelId)?.thinking !== 'none') {
 		return defaultOptions;
@@ -325,12 +335,8 @@ function resolveDefaultOptions(provider: LlmProvider, modelId: string, defaultOp
 function resolveInferenceOptions(
 	provider: LlmProvider,
 	modelId: string,
-	settings?: ModelInferenceSettings,
+	settings: ModelInferenceSettings = {},
 ): { callSettings?: ModelCallSettings; providerOverrides?: Record<string, unknown> } {
-	if (!settings) {
-		return {};
-	}
-
 	const capabilities = getModelCapabilities(provider, modelId);
 	const thinking = resolveThinking(provider, modelId, capabilities, settings);
 	const extraOverrides = resolveExtraOptions(provider, modelId, capabilities, settings);
@@ -395,7 +401,13 @@ export function fitThinkingBudget(
 
 	const anthropic = fitted.anthropic;
 	const thinking = anthropic?.thinking;
-	if (anthropic && thinking?.type === 'enabled' && thinking.budgetTokens !== undefined) {
+	if (
+		anthropic &&
+		thinking &&
+		'type' in thinking &&
+		thinking.type === 'enabled' &&
+		thinking.budgetTokens !== undefined
+	) {
 		const budget = fitBudget(thinking.budgetTokens, maxOutputTokens);
 		const rest = { ...anthropic };
 		delete rest.thinking;
@@ -461,17 +473,15 @@ function resolveThinking(
 					(e) => ({ reasoningConfig: { type: 'adaptive', maxReasoningEffort: EFFORT_TO_BEDROCK[e] } }),
 					(b) => ({ reasoningConfig: { type: 'enabled', budgetTokens: b } }),
 				)
-			: resolveClaudeThinking(
-					capabilities,
-					effort,
-					settings,
-					(e) => ({ thinking: { type: 'adaptive' }, effort: EFFORT_TO_ANTHROPIC[e] }),
-					(b) => ({ thinking: { type: 'enabled', budgetTokens: b } }),
-				);
+			: resolveAnthropicThinking(capabilities, effort, settings);
 	}
 
 	switch (kind) {
 		case 'openai':
+			return resolveEffortThinking(effort, (e) => ({
+				reasoningEffort: (capabilities?.effortMap ?? EFFORT_TO_OPENAI)[e],
+				forceReasoning: true,
+			}));
 		case 'azure':
 			return resolveEffortThinking(effort, (e) => ({
 				reasoningEffort: (capabilities?.effortMap ?? EFFORT_TO_OPENAI)[e],
@@ -509,6 +519,40 @@ function resolveQwenThinking(
 		providerOverrides: { enable_thinking: true, thinking_budget: settings.thinkingBudgetTokens },
 		thinkingActive: true,
 	};
+}
+
+/**
+ * Anthropic Messages API (direct or Vertex). The thinking display is the admin's choice, else the
+ * model's default (`updates` on models that hide thinking text); models that always think receive
+ * it even with effort off. Only models exposing the control send it, as Vertex rejects the field.
+ */
+function resolveAnthropicThinking(
+	capabilities: ModelCapabilities | undefined,
+	effort: ActiveEffort | undefined,
+	settings: ModelInferenceSettings,
+): ThinkingResult {
+	const display = resolveThinkingDisplay(capabilities, settings);
+	const adaptive = { type: 'adaptive', ...(display && { display }) };
+	if (capabilities?.thinking === 'adaptive' && !effort && capabilities.thinkingAlwaysOn) {
+		return { providerOverrides: { thinking: adaptive }, thinkingActive: true };
+	}
+	return resolveClaudeThinking(
+		capabilities,
+		effort,
+		settings,
+		(e) => ({ thinking: adaptive, effort: EFFORT_TO_ANTHROPIC[e] }),
+		(b) => ({ thinking: { type: 'enabled', budgetTokens: b } }),
+	);
+}
+
+function resolveThinkingDisplay(
+	capabilities: ModelCapabilities | undefined,
+	settings: ModelInferenceSettings,
+): ThinkingDisplay | undefined {
+	if (!capabilities?.extraParams?.includes('thinkingDisplay')) {
+		return undefined;
+	}
+	return settings.thinkingDisplay ?? capabilities.thinkingDisplay;
 }
 
 function resolveClaudeThinking(
@@ -579,7 +623,7 @@ function resolveExtraOptions(
 	const overrides: Record<string, unknown> = {};
 	for (const key of extraParams) {
 		const value = settings[key];
-		if (value === undefined) {
+		if (value === undefined || key === 'thinkingDisplay') {
 			continue;
 		}
 		if (key === 'parallelToolCalls' && isAnthropicApiModel(provider, modelId)) {
