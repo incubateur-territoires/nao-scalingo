@@ -91,18 +91,29 @@ démarrage), il passe par le proxy ; sinon il utilise le CLI.
 Avec un token API Scalingo **dédié** (dashboard → Profil → Tokens), pour pouvoir le révoquer seul :
 
 ```bash
-read -rs SCALINGO_API_TOKEN            # évite de laisser le token dans l'historique
+umask 077                                        # .env.fgp porte un credential
+read -rsp 'Token API Scalingo : ' SCALINGO_API_TOKEN; echo
 jq -n --arg token "$SCALINGO_API_TOKEN" --slurpfile scopes fgp-scopes.json \
   '{token: $token, target: "https://api.osc-secnum-fr1.scalingo.com",
     auth: "scalingo-exchange", scopes: $scopes[0], ttl: 2592000}' |
-  curl -sS -X POST https://fgp.incubateur.net/api/generate \
-    -H 'Content-Type: application/json' --data @- |
-  jq -r '"FGP_KEY=\(.key)\nFGP_BLOB=\(.blob)"' > .env.fgp
+  curl -sS --fail-with-body -X POST https://fgp.incubateur.net/api/generate \
+    -H 'Content-Type: application/json' --data @- > /tmp/fgp-gen.json
 unset SCALINGO_API_TOKEN
+
+# On ne remplace .env.fgp qu'après avoir vérifié la réponse : une génération en échec
+# écrirait FGP_KEY=null / FGP_BLOB=null et casserait un accès qui marchait.
+jq -e '.key and .blob' /tmp/fgp-gen.json > /dev/null \
+  && jq -r '"FGP_KEY=\(.key)\nFGP_BLOB=\(.blob)"' /tmp/fgp-gen.json > .env.fgp \
+  && echo "blob écrit dans .env.fgp" || cat /tmp/fgp-gen.json
+rm -f /tmp/fgp-gen.json
 ```
 
 `ttl` est en secondes (2592000 = 30 jours ; `0` = sans expiration, déconseillé). La clé n'est
-renvoyée qu'une fois : sans elle le blob est inutilisable.
+renvoyée qu'une fois : sans elle le blob est inutilisable. Le token transite en argument de `jq`,
+donc visible dans `ps` le temps de l'appel : à éviter sur une machine partagée.
+
+Après chaque régénération, rejouer `./nao-scalingo.sh check <produit>` : c'est ce qui vérifie que
+les scopes du blob correspondent bien à `fgp-scopes.json`.
 
 Le token Scalingo n'est ni stocké par le proxy ni récupérable depuis le blob — le déchiffrement
 exige la clé client **et** un sel connu du seul serveur. En revanche `fgp.incubateur.net` voit le
@@ -114,34 +125,65 @@ tiers de confiance à assumer, ou à auto-héberger (le projet est open source).
 | Commande | Appels Scalingo | Mode FGP |
 |---|---|---|
 | `deploy` / `update` | `POST /v1/sources`, `PUT` sur l'URL pré-signée, `POST /v1/apps/nao-*/deployments` | oui, avec suivi du statut |
-| `env`, `set-env`, `set-key` | `GET` et `PUT /v1/apps/nao-*/variables` | oui |
-| `restart`, `scale`, `status`, `cache-clear` | endpoints correspondants sous `/v1/apps/nao-*` | oui |
+| `env` | `GET /v1/apps/nao-*/variables` | oui |
+| `set-env`, `set-key` | `PUT /v1/apps/nao-*/variables` puis `POST .../restart` | oui — le PUT seul ne redémarre pas l'app, contrairement à la CLI |
+| `restart`, `scale`, `cache-clear` | endpoints correspondants sous `/v1/apps/nao-*` | oui |
+| `status` | `GET /v1/apps/nao-*/containers` | oui, dégradé : types de conteneurs, pas les instances en cours |
 | `create` | `POST /v1/apps` (nom `nao-*`, sans parent) puis `POST /v1/apps/nao-*/addons` | oui |
 | `run` | `POST /v1/apps/nao-*/run` | oui, en détaché (sortie dans les logs) |
-| `logs` | `GET /v1/apps/nao-*/logs` puis l'URL signée renvoyée | oui, n dernières lignes |
-| `list`, `destroy`, `open`, `logs -f`, `run` interactif | — | non : réservés au CLI |
+| `logs` | `GET /v1/apps/nao-*/logs` puis l'URL signée renvoyée | oui, n dernières lignes (pas de suivi continu) |
+| `open` | — | oui, affiche l'URL au lieu de l'ouvrir |
+| `list`, `destroy`, `logs -f`, `run` interactif | — | non : réservés au CLI |
 
 `list` verrait toutes les apps du compte, `destroy` est irréversible : les deux sortent du blob et
 le script les refuse explicitement en mode FGP.
 
+### Pourquoi les scopes de lecture sont ancrés sur un sous-chemin
+
+Le `*` de FGP traverse les `/`. Un scope `GET:/v1/apps/nao-*` ne donne donc pas accès à l'app :
+il donne accès à **toutes ses sous-ressources**, dont `/collaborators` (qui expose le
+`invitation_link` d'une invitation en attente — de quoi devenir collaborateur de plein droit, donc
+obtenir le `DELETE` que ce blob refuse), `/log_drains` et `/notifiers` (credentials de services
+tiers dans l'URL), et `/events` (adresses du compte).
+
+D'où la forme de `fgp-scopes.json` : chaque lecture est ancrée sur le sous-chemin utilisé
+(`/variables`, `/containers`, `/addons`, `/logs`, `/deployments`), et **l'app elle-même n'est pas
+lisible** — aucun motif ne peut la couvrir sans couvrir aussi le reste. `check` le vérifie.
+
+### Ce que le blob permet vraiment
+
+À l'intérieur du périmètre `nao-*`, le porteur du blob peut lire **tous les secrets** des instances
+(`GET /variables` : clés LLM, URL de base, token git du contexte), exécuter une commande arbitraire
+dans un conteneur (`POST /run`) et déployer du code depuis n'importe quelle URL
+(`POST /deployments`). La garantie tenue est donc précise, et plus étroite qu'« accès restreint » :
+
+- le token de compte n'est jamais détenu par le porteur du blob ;
+- aucune app hors `nao-*` n'est touchée, et aucune app n'est supprimable.
+
+Pour un agent qui n'opère qu'une seule instance, générer un blob dont les scopes nomment cette app
+en clair (`/v1/apps/nao-foo/variables` au lieu de `nao-*`) réduit d'autant le rayon d'action.
+
 ### Vérifier l'étanchéité
 
 ```bash
-./nao-scalingo.sh check <produit>   # lit l'app visée, puis vérifie que GET /v1/apps est refusé
+./nao-scalingo.sh check <produit>
 ```
 
-Recette faite en amont avec un blob jetable (token bidon : les appels autorisés s'arrêtent à
+Lit les types de conteneurs de l'app visée, puis vérifie que trois requêtes sont **refusées en
+403** : la liste des apps du compte, l'app elle-même, et la suppression d'une app `nao-*`
+(sur un nom inexistant, pour que le test reste sans effet). Un refus pour une autre raison — blob
+expiré, token révoqué, réseau — est signalé comme non concluant plutôt que compté comme un succès.
+
+Recette complémentaire passée avec un blob jetable (token bidon : les appels autorisés s'arrêtent à
 l'échange de token, donc rien n'est créé) :
 
 | Requête | Résultat |
 |---|---|
-| `GET /v1/apps/nao-…` | passe le scope (`502 auth_exchange_failed`, token bidon) |
-| `GET /v1/apps/autre-app` | `403 scope_denied` |
+| `GET /v1/apps/autre-app/variables` | `403 scope_denied` |
 | `PUT /v1/apps/autre/variables` | `403 scope_denied` |
 | `POST /v1/apps` avec `name: "autre-foo"` | `403 scope_denied` |
 | `DELETE /v1/apps/nao-x` | `403 scope_denied` |
-| `GET /v1/apps/nao-x/../autre/variables` | `403 scope_denied` |
-| `GET /v1/apps/nao-x%2f..%2fautre/variables` | `403 scope_denied` |
+| `…/nao-x/../autre/variables` et sa variante `%2f` | `403 scope_denied` |
 
 ### Le cas `parent_id` (réglé)
 
@@ -150,9 +192,13 @@ l'échange de token, donc rien n'est créé) :
 sait pas exiger l'**absence** d'un champ, donc `fgp-scopes.json` exige un `app.parent_id` **vide** et
 le script envoie toujours `"parent_id": ""`.
 
-Validé en direct : l'API Scalingo accepte `"parent_id": ""` et crée l'app normalement, et le blob
-refuse la même requête si le champ est absent ou désigne une autre app. La suppression de l'app
-créée reste hors scope (`403`), donc au CLI.
+Validé en direct avec le vrai blob (création de `nao-fgp-test`) : l'API Scalingo accepte
+`"parent_id": ""` et crée l'app normalement, et le blob refuse la même requête si le champ est
+absent ou désigne une autre app. La suppression de l'app créée reste hors scope (`403`), donc au CLI.
+
+À savoir tout de même : `parent_id` n'apparaît pas dans la documentation de `POST /v1/apps`, et la
+route documentée des apps enfants est `POST /v1/apps/:parent/child_apps`, qu'aucun scope ne couvre.
+Ce filtre est donc une ceinture en plus des bretelles, pas la protection principale.
 
 ### Fermer l'accès complet sur le poste de l'agent
 
@@ -197,11 +243,16 @@ mais pas un sous-processus qui lirait le fichier par un autre chemin (un script 
 `scalingo` lui-même). Pour la même protection ailleurs, reprendre le bloc `sandbox.enabled` dans le
 projet concerné.
 
-`deploy` envoie l'archive sur une URL pré-signée du stockage Scalingo, dont l'hôte n'est pas connu à
-l'avance : au premier déploiement, le sandbox nomme l'hôte refusé, à ajouter à `allowedDomains`.
+`deploy` envoie l'archive sur l'URL pré-signée renvoyée par `POST /v1/sources`, normalement sur
+l'hôte de l'API — déjà couvert par le motif ci-dessus. Si Scalingo redirige vers un stockage objet,
+le sandbox nommera l'hôte refusé : à ajouter alors à `allowedDomains` (le script suit déjà les
+redirections).
 
-Plus radical : `scalingo logout` sur cette machine, ou faire tourner l'agent dans une VM où
-`~/.config/scalingo` n'existe pas.
+Plus radical, et surtout plus robuste : `scalingo logout` sur cette machine, ou faire tourner
+l'agent dans une VM où `~/.config/scalingo` n'existe pas. La configuration ci-dessus dépend de la
+sémantique des réglages de Claude Code (vérifiée avec la version 2.1.281) : si elle évolue, la
+protection cesse de s'appliquer sans que rien ne le signale. Un token absent de la machine, lui,
+ne dépend de personne.
 
 ### Customiser une instance (overlay)
 

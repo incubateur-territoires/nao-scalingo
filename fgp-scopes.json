@@ -13,7 +13,12 @@
       }
     ]
   },
-  "GET:/v1/apps/nao-*",
+  "GET:/v1/apps/nao-*/variables",
+  "GET:/v1/apps/nao-*/containers",
+  "GET:/v1/apps/nao-*/addons",
+  "GET:/v1/apps/nao-*/logs",
+  "GET:/v1/apps/nao-*/deployments",
+  "GET:/v1/apps/nao-*/deployments/*",
   "PUT:/v1/apps/nao-*/variables",
   "POST:/v1/apps/nao-*/addons",
   "POST:/v1/apps/nao-*/deployments",
@@ -22,5 +27,5 @@
   "POST:/v1/apps/nao-*/run",
   "DELETE:/v1/apps/nao-*/caches/deployment",
   "POST:/v1/sources",
-  "GET:/v1/addon_providers/*"
+  "GET:/v1/addon_providers/postgresql/plans"
 ]
