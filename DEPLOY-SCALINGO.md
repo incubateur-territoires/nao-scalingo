@@ -92,7 +92,8 @@ Avec un token API Scalingo **dédié** (dashboard → Profil → Tokens), pour p
 
 ```bash
 umask 077                                        # .env.fgp porte un credential
-read -rsp 'Token API Scalingo : ' SCALINGO_API_TOKEN; echo
+printf 'Token API Scalingo : '                   # printf plutôt que read -p : marche en zsh
+read -rs SCALINGO_API_TOKEN; echo
 jq -n --arg token "$SCALINGO_API_TOKEN" --slurpfile scopes fgp-scopes.json \
   '{token: $token, target: "https://api.osc-secnum-fr1.scalingo.com",
     auth: "scalingo-exchange", scopes: $scopes[0], ttl: 2592000}' |
