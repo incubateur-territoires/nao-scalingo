@@ -1,13 +1,14 @@
-import { useQuery } from '@tanstack/react-query';
 import { AlertCircleIcon, CheckIcon, CopyIcon, CreditCardIcon, RotateCcwIcon } from 'lucide-react';
 import { Button } from '../ui/button';
 import { Callout } from '../ui/callout';
-import { useAgentContext, useAgentMessages } from '@/contexts/agent.provider';
+import type { UIMessage } from '@nao/backend/chat';
+import { useAgentContext, useAgentMessagesSelector } from '@/contexts/agent.provider';
+import { useCloudBillingAccess } from '@/hooks/use-cloud-billing-access';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
 import { useOpenOrganizationBilling } from '@/hooks/use-open-organization-billing';
-import { parseBudgetError } from '@/lib/ai';
+import { getLastUserMessageIdx, parseBudgetError } from '@/lib/ai';
+import { isCloudBillingAccessError } from '@/lib/cloud-billing-access';
 import { cn } from '@/lib/utils';
-import { trpc } from '@/main';
 
 export interface Props {
 	className?: string;
@@ -45,29 +46,25 @@ function asString(value: unknown): string | undefined {
 
 export function ChatError({ className }: Props) {
 	const { error, isRunning, resendMessage, clearError } = useAgentContext();
-	const messages = useAgentMessages();
+	const lastUserMessageId = useAgentMessagesSelector(findLastUserMessageId);
 	const { isCopied, copy } = useCopyToClipboard();
 	const openOrganizationBilling = useOpenOrganizationBilling();
 	const parsed = error ? parseError(error) : null;
 	const isBillingAccessError = isCloudBillingAccessError(parsed);
-	const billingAccess = useQuery({
-		...trpc.billing.getAccess.queryOptions(),
-		enabled: isBillingAccessError,
-	});
+	const billingAccess = useCloudBillingAccess({ enabled: isBillingAccessError });
 
 	if (!error || parseBudgetError(error)) {
 		return null;
 	}
 
 	const requestId = parsed?.requestId;
-	const lastUserMessage = [...messages].reverse().find((message) => message.role === 'user');
 	const retry = async () => {
-		if (!lastUserMessage) {
+		if (!lastUserMessageId) {
 			return;
 		}
 
 		clearError();
-		await resendMessage({ messageId: lastUserMessage.id });
+		await resendMessage({ messageId: lastUserMessageId });
 	};
 
 	if (isBillingAccessError) {
@@ -79,7 +76,7 @@ export function ChatError({ className }: Props) {
 				isAccessPending={billingAccess.isPending}
 				isAccessError={billingAccess.isError}
 				isAccessFetching={billingAccess.isFetching}
-				canRetry={Boolean(lastUserMessage)}
+				canRetry={Boolean(lastUserMessageId)}
 				onManageBilling={(organizationId) => void openOrganizationBilling(organizationId)}
 				onRetryAccess={() => void billingAccess.refetch()}
 				onRetry={() => void retry()}
@@ -112,7 +109,7 @@ export function ChatError({ className }: Props) {
 						</Button>
 					</div>
 				)}
-				{lastUserMessage && (
+				{lastUserMessageId && (
 					<Button
 						variant='outline'
 						size='sm'
@@ -200,6 +197,7 @@ function BillingAccessError({
 	);
 }
 
-function isCloudBillingAccessError(error: ParsedError | null): boolean {
-	return [error?.error, error?.message].some((value) => value?.includes('Cloud billing access is restricted'));
+function findLastUserMessageId(messages: UIMessage[]): string | undefined {
+	const lastUserMessageIndex = getLastUserMessageIdx(messages);
+	return lastUserMessageIndex !== undefined ? messages[lastUserMessageIndex].id : undefined;
 }

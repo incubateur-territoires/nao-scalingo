@@ -14,6 +14,7 @@ import type { ToolContext } from '../types/tools';
 import { logger } from '../utils/logger';
 import { buildDownloadResponse, type QueryDataMap } from '../utils/story-download';
 import { createTool } from '../utils/tools';
+import { getActiveThemeForProject } from './custom-story';
 import { emailService } from './email';
 import {
 	createGithubAutomationTools,
@@ -145,7 +146,7 @@ function createEmailTools(projectId: string, integrations: AutomationIntegration
 		send_automation_email: createTool({
 			description: getEmailToolDescription(),
 			inputSchema: z.object({
-				recipients: z.array(z.string().email()).default([]),
+				recipients: z.array(z.string().min(1)).default([]),
 				subject: z.string().min(1).optional(),
 				html: z.string().min(1).optional(),
 				text: z.string().min(1).optional(),
@@ -154,11 +155,17 @@ function createEmailTools(projectId: string, integrations: AutomationIntegration
 				if (!emailService.isEnabled()) {
 					throw new Error('SMTP email is not configured.');
 				}
+				const resolvedRecipients = [...new Set([...recipients, ...config.recipients])];
+				const invalidRecipients = resolvedRecipients.filter(
+					(recipient) => !z.string().email().safeParse(recipient).success,
+				);
+				if (invalidRecipients.length > 0) {
+					throw new Error(`Invalid email recipient(s): ${invalidRecipients.join(', ')}`);
+				}
 				const attachments = await buildGeneratedArtifactAttachments(projectId, context);
 				const content = appendInlineImages(html ?? `<pre>${escapeHtml(text ?? '')}</pre>`, attachments);
 				const emailAttachments = attachments.map(toEmailAttachment);
 				const resolvedSubject = config.subject ?? subject ?? 'nao automation report';
-				const resolvedRecipients = [...new Set([...recipients, ...config.recipients])];
 				await Promise.all(
 					resolvedRecipients.map((recipient) =>
 						emailService.sendEmail(
@@ -282,7 +289,7 @@ async function buildGeneratedArtifactAttachments(
 	const dateFormat = displaySettings.dateFormat ?? null;
 	const chartAttachments = await buildChartImageAttachments(context, dateFormat);
 	const mapAttachments = await buildMapImageAttachments(projectId, context);
-	const storyAttachments = await buildStoryPdfAttachments(context, dateFormat);
+	const storyAttachments = await buildStoryPdfAttachments(projectId, context, dateFormat);
 	return [...chartAttachments, ...mapAttachments, ...storyAttachments];
 }
 
@@ -348,10 +355,15 @@ async function buildChartImageAttachments(
 }
 
 async function buildStoryPdfAttachments(
+	projectId: string,
 	context: ToolContext,
 	dateFormat: DateFormatSettings | null,
 ): Promise<GeneratedArtifactAttachment[]> {
 	const stories = uniqueStories(context.generatedArtifacts.stories);
+	if (stories.length === 0) {
+		return [];
+	}
+	const theme = await getActiveThemeForProject(projectId);
 
 	return Promise.all(
 		stories.map(async (story) => {
@@ -361,7 +373,7 @@ async function buildStoryPdfAttachments(
 			}
 
 			const queryData = await getStoryQueryData(context, latest.code);
-			const pdf = await buildDownloadResponse('pdf', latest.title, latest.code, queryData, dateFormat);
+			const pdf = await buildDownloadResponse('pdf', latest.title, latest.code, queryData, dateFormat, theme);
 			return {
 				kind: 'story',
 				title: latest.title,

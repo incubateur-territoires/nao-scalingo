@@ -15,6 +15,7 @@ import {
 	KeyRound,
 	LifeBuoy,
 	Palette,
+	Plug,
 	ShieldCheck,
 	TriangleAlert,
 	UserCheck,
@@ -26,7 +27,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { SettingsCard, SettingsPageWrapper } from '@/components/ui/settings-card';
 import { useLicenseFeatures } from '@/hooks/use-license';
-import { requireNonViewerNonCloud } from '@/lib/require-admin';
+import { requireNonViewerNonCloud } from '@/lib/route-guards';
 import { cn } from '@/lib/utils';
 import { trpc } from '@/main';
 
@@ -273,6 +274,12 @@ export const ENTERPRISE_FEATURES = [
 		label: 'Row-level security',
 		description: "Restrict which rows each person can see, using your warehouse's own rules.",
 		icon: ShieldCheck,
+	},
+	{
+		key: 'row-level-security',
+		label: 'MCP access per group',
+		description: 'Choose which MCP servers and tools each group can use.',
+		icon: Plug,
 	},
 	{
 		label: 'Data rights impersonation from warehouse',

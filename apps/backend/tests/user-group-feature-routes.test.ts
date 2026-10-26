@@ -1,8 +1,10 @@
+import { TRPCError } from '@trpc/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
 	automationsEnabled: true,
 	archiveStory: vi.fn(),
+	assertOrganizationCloudBillingAccess: vi.fn(),
 	buildDownloadResponse: vi.fn(),
 	deleteAutomation: vi.fn(),
 	createSharedStory: vi.fn(),
@@ -67,7 +69,7 @@ vi.mock('../src/queries/chat.queries', () => ({
 }));
 vi.mock('../src/queries/project.queries', () => ({
 	getDisplaySettings: mocks.getDisplaySettings,
-	getProjectByUserId: vi.fn(async () => ({ id: 'project-id', name: 'Project' })),
+	getProjectByUserId: vi.fn(async () => ({ id: 'project-id', name: 'Project', orgId: 'org-id' })),
 	getUserRoleInProject: vi.fn(async () => mocks.role),
 }));
 vi.mock('../src/queries/shared-story.queries', () => ({
@@ -89,6 +91,7 @@ vi.mock('../src/queries/story.queries', () => ({
 	getStoryOwnerId: mocks.getStoryOwnerId,
 	getStoryProjectId: mocks.getStoryProjectId,
 	getStorySharingInfo: mocks.getStorySharingInfo,
+	getStoryQueryDataByStoryIds: vi.fn(async () => new Map()),
 	getVersionByNumber: mocks.getVersionByNumber,
 	listUserChatStories: mocks.listUserChatStories,
 	renameStory: mocks.renameStory,
@@ -100,6 +103,10 @@ vi.mock('../src/queries/story-folder.queries', () => ({
 }));
 vi.mock('../src/services/activity', () => ({ logActivity: mocks.logActivity }));
 vi.mock('../src/services/agent', () => ({ agentService: { get: vi.fn() } }));
+vi.mock('../src/services/cloud-billing-access.service', () => ({
+	assertOrganizationCloudBillingAccess: mocks.assertOrganizationCloudBillingAccess,
+	assertProjectCloudBillingAccess: vi.fn(),
+}));
 vi.mock('../src/services/live-story', () => ({
 	executeLiveQuery: vi.fn(),
 	getStoryQueryData: mocks.getStoryQueryData,
@@ -213,6 +220,32 @@ describe('user group feature route enforcement', () => {
 		expect(mocks.deleteAutomation).toHaveBeenCalledWith('project-id', 'user-id', 'automation-id');
 	});
 
+	it('requires billing access to enable an Automation but allows disabling', async () => {
+		mocks.assertOrganizationCloudBillingAccess.mockRejectedValueOnce(
+			new TRPCError({ code: 'FORBIDDEN', message: 'Cloud billing access is restricted' }),
+		);
+
+		await expect(createCaller().automation.setEnabled({ id: 'automation-id', enabled: false })).resolves.toBeNull();
+		await expect(
+			createCaller().automation.update({
+				id: 'automation-id',
+				title: 'Paused',
+				prompt: 'Prompt',
+				webhookEnabled: true,
+				enabled: false,
+			}),
+		).resolves.toBeNull();
+		expect(mocks.assertOrganizationCloudBillingAccess).not.toHaveBeenCalled();
+
+		await expect(
+			createCaller().automation.setEnabled({ id: 'automation-id', enabled: true }),
+		).rejects.toMatchObject({
+			code: 'FORBIDDEN',
+			message: 'Cloud billing access is restricted',
+		});
+		expect(mocks.assertOrganizationCloudBillingAccess).toHaveBeenCalledWith('org-id');
+	});
+
 	it('preserves the Automation beta check before the creation grant', async () => {
 		mocks.automationsEnabled = false;
 
@@ -324,6 +357,7 @@ describe('user group feature route enforcement', () => {
 			'# Old version\n<table query_id="query_old" />',
 			queryData,
 			'MM/dd/yyyy',
+			null,
 		);
 	});
 
@@ -365,6 +399,7 @@ describe('user group feature route enforcement', () => {
 			'# Refreshed latest version',
 			queryData,
 			'MM/dd/yyyy',
+			null,
 		);
 	});
 

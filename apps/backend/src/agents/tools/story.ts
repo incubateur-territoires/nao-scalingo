@@ -15,7 +15,7 @@ import {
 	publishCustomStoryDraft,
 } from '../../services/custom-story-authoring';
 import { customStoryAuthoringError, isCustomStoriesEnabled } from '../../services/story-mount';
-import { getStoryTemplateWarnings } from '../../services/story-template-validation';
+import { getStoryTemplateWarnings, sqlQueriesFromResults } from '../../services/story-template-validation';
 import type { ToolContext } from '../../types/tools';
 import { normalizeStoryFilePath } from '../../utils/story-file-path';
 import { isValidStorySlug, STORIES_MOUNT, STORY_SLUG_RULE } from '../../utils/story-mount';
@@ -53,7 +53,7 @@ export function buildStoryToolDescription({
 		'Use consecutive <tab title="...">...</tab> blocks to organize a story into top-level tabs.',
 		'Default to a single flowing story. Use tabs only when the user asks for tabs, or when the content splits into clearly distinct sections that are better separated than stacked (e.g. overview vs. detail, one topic/department/metric per tab). Avoid tabs for a short or single-topic story. Always follow the user\'s explicit request (e.g. "a tab per chart" means one chart per tab). When using tabs, the entire story must consist of <tab title="...">...</tab> blocks — no content outside a tab.',
 		'A story can also be refered as a "canva", an "artifact" or a "report".',
-		'Users may edit stories directly; the tool result always reflects the latest version, including user edits.',
+		'Users may edit stories directly; when present, the <conversation-artifacts> block of the latest user message holds the current content of every classic story in this conversation, including user edits, and the draft file paths of custom stories (read them before editing). The tool result reflects the version just produced.',
 		'Unless explicitly stated, dont use the stories to display a chart, but the display_chart tool.',
 		...(customStories ? [customStoryDescription(canReplace)] : []),
 	].join(' ');
@@ -203,7 +203,7 @@ async function classicResult(
 		version: version.version,
 		code: version.code,
 		title: version.title,
-		...(await storyTemplateWarnings(context.chatId, version.code)),
+		...(await storyTemplateWarnings(context, version.code)),
 	};
 }
 
@@ -386,9 +386,13 @@ async function carryOverTableFormatting(code: string, chatId: string): Promise<s
 }
 
 /** The story version is already committed at this point, so a warning failure must not fail the tool. */
-async function storyTemplateWarnings(chatId: string, code: string): Promise<{ template_warnings?: string[] }> {
+async function storyTemplateWarnings(context: ToolContext, code: string): Promise<{ template_warnings?: string[] }> {
 	try {
-		const warnings = await getStoryTemplateWarnings(chatId, code);
+		const warnings = await getStoryTemplateWarnings(
+			context.chatId,
+			code,
+			sqlQueriesFromResults(context.queryResults),
+		);
 		return warnings.length > 0 ? { template_warnings: warnings } : {};
 	} catch (error) {
 		console.error('Failed to compute story template warnings', error);

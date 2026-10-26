@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import Fastify, { type FastifyInstance } from 'fastify';
+import { exportSPKI, generateKeyPair, SignJWT } from 'jose';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/db/db', async () => {
@@ -35,6 +36,7 @@ import { db } from '../src/db/db';
 import { __reloadEnvForTesting } from '../src/env';
 import { backofficeRoutes } from '../src/routes/backoffice';
 import { cleanupContextWorktree } from '../src/services/context-explorer-git.service';
+import { __setBundledPublicKeyForTesting } from '../src/services/license-public-key';
 import { removeOrganizationMember } from '../src/services/membership.service';
 
 const API_KEY = 'backoffice-test-key-at-least-32-characters';
@@ -54,6 +56,10 @@ describe('cloud backoffice routes', () => {
 		originalEnv = { ...process.env };
 		process.env.NAO_MODE = 'cloud';
 		process.env.NAO_BACKOFFICE_API_KEY = API_KEY;
+		process.env.CLOUD_GITHUB_PROJECT_ORG = 'test-org';
+		process.env.CLOUD_GITHUB_PROJECT_APP_ID = '123';
+		process.env.CLOUD_GITHUB_PROJECT_INSTALLATION_ID = '456';
+		process.env.CLOUD_GITHUB_PROJECT_PRIVATE_KEY = 'test-private-key';
 		__reloadEnvForTesting();
 		projectPath = await fs.mkdtemp(path.join(os.tmpdir(), 'nao-backoffice-test-'));
 		await fs.writeFile(
@@ -217,6 +223,69 @@ describe('cloud backoffice routes', () => {
 		expect(JSON.stringify(user.json())).not.toContain(SECRET);
 	});
 
+	it('serves organization billing state and the billing overview', async () => {
+		const organizations = await get('/organizations');
+		expect(organizations.json().items[0].billing).toMatchObject({
+			state: 'trialing',
+			status: 'trialing',
+			interval: 'monthly',
+			hasAccess: true,
+			hasDefaultPaymentMethod: true,
+			stripeCustomerId: 'cus_test',
+		});
+
+		const billing = await get(`/organizations/${ORG_ID}/billing`);
+		expect(billing.statusCode).toBe(200);
+		expect(billing.json()).toMatchObject({
+			billing: { state: 'trialing', stripeSubscriptionId: 'sub_test' },
+			stripe: null,
+			stripeError: null,
+		});
+
+		const overview = await get('/billing');
+		expect(overview.statusCode).toBe(200);
+		expect(overview.json()).toMatchObject({
+			billingEnabled: false,
+			stripeMode: null,
+			revenue: null,
+			organizations: [{ id: ORG_ID, billing: { state: 'trialing' } }],
+			events: [{ id: 'evt_test', type: 'customer.subscription.created', orgId: ORG_ID }],
+		});
+
+		await db.delete(s.organizationBilling);
+		const bypassed = await request('PATCH', `/organizations/${ORG_ID}`, { bypassBilling: true });
+		expect(bypassed.json().billing).toMatchObject({ state: 'bypassed', status: null, hasAccess: true });
+	});
+
+	it('stores a verified organization license without ever returning the token', async () => {
+		const { privateKey, publicKey } = await generateKeyPair('EdDSA', { crv: 'Ed25519', extractable: true });
+		__setBundledPublicKeyForTesting(await exportSPKI(publicKey));
+		try {
+			const forOtherOrganization = await signOrganizationLicense(privateKey, 'org-other');
+			const rejected = await request('PATCH', `/organizations/${ORG_ID}`, { license: forOtherOrganization });
+			expect(rejected.statusCode).toBe(400);
+
+			const malformed = await request('PATCH', `/organizations/${ORG_ID}`, { license: 'not-a-license' });
+			expect(malformed.statusCode).toBe(400);
+			expect((await get(`/organizations/${ORG_ID}`)).json().organization.license).toBeNull();
+
+			const token = await signOrganizationLicense(privateKey, ORG_ID);
+			const licensed = await request('PATCH', `/organizations/${ORG_ID}`, { license: token });
+			expect(licensed.statusCode).toBe(200);
+			expect(licensed.json().license).toMatchObject({
+				status: 'active',
+				companyName: 'Acme Corp',
+				features: ['user-groups'],
+			});
+			expect(licensed.body).not.toContain(token);
+
+			const removed = await request('PATCH', `/organizations/${ORG_ID}`, { license: null });
+			expect(removed.json().license).toBeNull();
+		} finally {
+			__setBundledPublicKeyForTesting(null);
+		}
+	});
+
 	it('updates organizations, users, and memberships', async () => {
 		const renamedOrg = await request('PATCH', `/organizations/${ORG_ID}`, { name: 'Renamed Organization' });
 		expect(renamedOrg.statusCode).toBe(200);
@@ -226,6 +295,7 @@ describe('cloud backoffice routes', () => {
 		const bypassedOrg = await request('PATCH', `/organizations/${ORG_ID}`, { bypassBilling: true });
 		expect(bypassedOrg.statusCode).toBe(200);
 		expect(bypassedOrg.json().bypassBilling).toBe(true);
+		expect(bypassedOrg.json().license).toBeNull();
 
 		const updatedUser = await request('PATCH', `/users/${MEMBER_ID}`, {
 			name: 'Renamed Member',
@@ -321,6 +391,8 @@ async function clearData() {
 	await db.delete(s.projectMember);
 	await db.delete(s.orgMember);
 	await db.delete(s.project);
+	await db.delete(s.stripeWebhookEvent);
+	await db.delete(s.organizationBilling);
 	await db.delete(s.organization);
 	await db.delete(s.user);
 }
@@ -345,6 +417,22 @@ async function seedData(projectPath: string) {
 		googleClientId: 'GOOGLE_CLIENT_ID_DO_NOT_LEAK',
 		googleClientSecret: 'GOOGLE_CLIENT_SECRET_DO_NOT_LEAK',
 		googleAuthDomains: 'example.com',
+	});
+	await db.insert(s.organizationBilling).values({
+		orgId: ORG_ID,
+		billingPlan: 'cloud_monthly_v2',
+		billingStatus: 'trialing',
+		trialStartedAt: now,
+		trialEndsAt: new Date(now.getTime() + 14 * 24 * 60 * 60 * 1_000),
+		stripeCustomerId: 'cus_test',
+		stripeSubscriptionId: 'sub_test',
+		hasDefaultPaymentMethod: true,
+	});
+	await db.insert(s.stripeWebhookEvent).values({
+		id: 'evt_test',
+		type: 'customer.subscription.created',
+		stripeObjectId: 'sub_test',
+		livemode: false,
 	});
 	await db.insert(s.orgMember).values([
 		{ orgId: ORG_ID, userId: ADMIN_ID, role: 'admin' },
@@ -448,4 +536,20 @@ async function seedData(projectPath: string) {
 		createdAt: now,
 		updatedAt: now,
 	});
+}
+
+async function signOrganizationLicense(privateKey: CryptoKey, orgId: string): Promise<string> {
+	const now = Math.floor(Date.now() / 1000);
+	return new SignJWT({
+		subscriptionId: 'sub-1',
+		companyName: 'Acme Corp',
+		isOffline: true,
+		features: ['user-groups'],
+		orgId,
+	})
+		.setProtectedHeader({ alg: 'EdDSA' })
+		.setIssuer('getnao')
+		.setIssuedAt(now)
+		.setExpirationTime(now + 3600)
+		.sign(privateKey);
 }

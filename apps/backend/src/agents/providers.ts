@@ -43,6 +43,7 @@ import {
 	OPENAI_COMPATIBLE_BASE_URLS,
 	PROVIDER_META,
 } from './provider-meta';
+import { withWellFormedPrompt } from './well-formed-prompt';
 
 export {
 	getDefaultModelId,
@@ -195,6 +196,10 @@ export const LLM_PROVIDERS: LlmProvidersType = {
 		...PROVIDER_META.moonshot,
 		create: (settings, modelId) => createCompatibleModel('moonshot', settings, modelId),
 	},
+	meta: {
+		...PROVIDER_META.meta,
+		create: (settings, modelId) => createCompatibleModel('meta', settings, modelId),
+	},
 	requesty: {
 		...PROVIDER_META.requesty,
 		create: (settings, modelId) => createCompatibleModel('requesty', settings, modelId),
@@ -230,9 +235,10 @@ function createCompatibleModel(provider: LlmProvider, settings: ProviderSettings
 
 /** Named instances all speak the OpenAI-compatible API, so they skip their kind's own factory. */
 function createModel(provider: LlmProvider, settings: ProviderSettings, modelId: string): LanguageModelV3 {
-	return providerName(provider)
+	const model = providerName(provider)
 		? createCompatibleModel(provider, settings, modelId)
 		: LLM_PROVIDERS[providerKind(provider)].create(settings, modelId);
+	return withWellFormedPrompt(model);
 }
 
 export type ModelCallSettings = {
@@ -274,6 +280,10 @@ export function disableModelReasoning(provider: LlmProvider, modelResult: Provid
 		case 'requesty':
 		case 'openaiCompatible':
 			options.reasoningEffort = 'none';
+			break;
+		case 'meta':
+			// Muse models always reason and reject `none` with a 400.
+			options.reasoningEffort = 'minimal';
 			break;
 		case 'openrouter':
 			options.reasoning = { enabled: false };
@@ -357,7 +367,7 @@ function resolveInferenceOptions(
 			callSettings.temperature = clampNumber(settings.temperature, 0, temperatureMax);
 		}
 		if (settings.topP !== undefined) {
-			callSettings.topP = clampNumber(settings.topP, 0, 1);
+			callSettings.topP = clampNumber(settings.topP, capabilities?.topPMin ?? 0, 1);
 		}
 		if (settings.topK !== undefined && capabilities?.topK !== false) {
 			callSettings.topK = settings.topK;
@@ -494,7 +504,8 @@ function resolveThinking(
 		case 'vertex':
 			return resolveGeminiThinking(capabilities, effort, settings);
 		case 'moonshot':
-			// Kimi's own effort vocabulary, so the clamped value goes out as-is.
+		case 'meta':
+			// Kimi and Muse speak nao's effort vocabulary, so the clamped value goes out as-is.
 			return resolveEffortThinking(effort, (e) => ({ reasoningEffort: e }));
 		case 'qwen':
 			return resolveQwenThinking(capabilities, settings);
@@ -697,6 +708,10 @@ function resolveBedrockModelId(modelId: string, region: string): string {
 	const firstSegment = modelId.split('.')[0];
 	if (BEDROCK_REGION_PREFIXES.has(firstSegment)) {
 		const rest = modelId.slice(firstSegment.length + 1);
+		// OpenAI profile geography is explicit; equivalent EU/AP profiles may not exist.
+		if (rest.startsWith('openai.')) {
+			return modelId;
+		}
 		return firstSegment === prefix ? modelId : `${prefix}.${rest}`;
 	}
 	if (BEDROCK_CROSS_REGION_PROVIDERS.has(firstSegment)) {

@@ -437,6 +437,37 @@ describe('SystemPrompt built-in skills', () => {
 	});
 });
 
+describe('SystemPrompt preloaded skills', () => {
+	const skills = [
+		{ name: 'revenue', description: 'How to compute revenue.', location: '/agent/skills/revenue.md' },
+		{ name: 'churn', description: 'How to compute churn.', location: '/agent/skills/churn.md' },
+	];
+	const preloadedSkills = [{ ...skills[0], content: 'Always use net revenue.' }];
+
+	it('carries the full content of preloaded skills and says they are already loaded', () => {
+		const markdown = renderToMarkdown(SystemPrompt({ skills, preloadedSkills }));
+
+		expect(markdown).toContain('Preloaded Skills');
+		expect(markdown).toContain('already loaded below');
+		expect(markdown).toContain('Always use net revenue.');
+	});
+
+	it('keeps preloaded skills out of the regular skills listing', () => {
+		const markdown = renderToMarkdown(SystemPrompt({ skills, preloadedSkills }));
+
+		expect(markdown.match(/Skill: revenue/g)).toHaveLength(1);
+		expect(markdown).toContain('Skill: churn');
+		expect(markdown).not.toContain('How to compute revenue.');
+	});
+
+	it('omits the section when no skill is preloaded', () => {
+		const markdown = renderToMarkdown(SystemPrompt({ skills }));
+
+		expect(markdown).not.toContain('Preloaded Skills');
+		expect(markdown).toContain('Skill: revenue');
+	});
+});
+
 describe('SystemPrompt SQL query rules', () => {
 	it('forbids citing table documentation statistics as answers to data questions', () => {
 		const markdown = renderToMarkdown(SystemPrompt({}));
@@ -449,12 +480,14 @@ describe('SystemPrompt SQL query rules', () => {
 });
 
 describe('SystemPrompt follow-up suggestions rules', () => {
-	it('asks for a closing sentence pointing the user to the suggestions', () => {
+	it('requires the tool as the final call without asking the model to announce the UI', () => {
 		const markdown = renderToMarkdown(SystemPrompt({}));
 
 		expect(markdown).toContain('**suggest_follow_ups**');
-		expect(markdown).toContain('points the user to the suggestions shown below your message');
-		expect(markdown).toContain('never a note to yourself or part of your thinking');
+		expect(markdown).toContain('For every analytical response based on business data');
+		expect(markdown).toContain('as the sole and final tool call');
+		expect(markdown).not.toContain('points the user to the suggestions shown below your message');
+		expect(markdown).not.toContain('Pick one of the suggestions below');
 	});
 
 	it('omits the rule when the run excludes the tool', () => {

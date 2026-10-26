@@ -25,7 +25,12 @@ export type UserStoryRow = Pick<
 	| 'format'
 	| 'createdAt'
 	| 'updatedAt'
-> & { code: string; version: number; versionCreatedAt: DBStoryVersion['createdAt']; certifiedByName: string | null };
+> & {
+	code: string;
+	version: number;
+	versionCreatedAt: DBStoryVersion['createdAt'];
+	certifiedByName: string | null;
+};
 
 const storyCertifier = aliasedTable(s.user, 'story_certifier');
 
@@ -233,6 +238,48 @@ export async function listStoriesInChat(
 	}));
 }
 
+export type ChatStoryLatestVersion = Pick<DBStory, 'slug' | 'title' | 'format' | 'archivedAt'> & {
+	storyId: string;
+	version: number | null;
+	code: string | null;
+	source: DBStoryVersion['source'] | null;
+};
+
+/** Every story of a chat, archived included, with its latest version; a never-published custom draft has none. */
+export async function listLatestVersionsInChat(chatId: string): Promise<ChatStoryLatestVersion[]> {
+	const latest = db
+		.select({
+			storyId: s.storyVersion.storyId,
+			maxVersion: max(s.storyVersion.version).as('max_version'),
+		})
+		.from(s.storyVersion)
+		.innerJoin(s.story, eq(s.storyVersion.storyId, s.story.id))
+		.where(eq(s.story.chatId, chatId))
+		.groupBy(s.storyVersion.storyId)
+		.as('latest');
+
+	return db
+		.select({
+			storyId: s.story.id,
+			slug: s.story.slug,
+			title: s.story.title,
+			format: s.story.format,
+			archivedAt: s.story.archivedAt,
+			version: s.storyVersion.version,
+			code: s.storyVersion.code,
+			source: s.storyVersion.source,
+		})
+		.from(s.story)
+		.leftJoin(latest, eq(latest.storyId, s.story.id))
+		.leftJoin(
+			s.storyVersion,
+			and(eq(s.storyVersion.storyId, s.story.id), eq(s.storyVersion.version, latest.maxVersion)),
+		)
+		.where(eq(s.story.chatId, chatId))
+		.orderBy(asc(s.story.createdAt))
+		.execute();
+}
+
 export async function createStoryVersion(
 	data: {
 		chatId: string;
@@ -407,6 +454,27 @@ async function detachStoriesFromFolders(storyIds: string[]): Promise<void> {
 	await db.delete(s.storyFolderItem).where(inArray(s.storyFolderItem.storyId, storyIds)).execute();
 }
 
+/** Matches `story` rows the user owns or that are shared with them within the project. */
+export function storyVisibleToUser(userId: string, projectId: string): SQL {
+	return sql`(
+		exists (
+			select 1 from ${s.chat}
+			where ${s.chat.id} = ${s.story.chatId} and ${s.chat.userId} = ${userId}
+		)
+		or (${s.story.chatId} is null and ${s.story.userId} = ${userId})
+		or exists (
+			select 1 from ${s.sharedStory}
+			where ${s.sharedStory.storyId} = ${s.story.id}
+			  and ${s.sharedStory.projectId} = ${projectId}
+			  and (
+				${s.sharedStory.userId} = ${userId}
+				or ${s.sharedStory.visibility} = 'project'
+				or ${sharedStoryGrantsUser(userId)}
+			  )
+		)
+	)`;
+}
+
 export async function canUserAccessStory(storyId: string, userId: string): Promise<boolean> {
 	const [owned] = await db
 		.select({ id: s.story.id })
@@ -544,6 +612,29 @@ export function getStoryDataCacheByStoryId(storyId: string): Promise<DBStoryData
 	return getStoryDataCache(eq(s.story.id, storyId));
 }
 
+export async function getStoryDataCachedAt(storyId: string): Promise<Date | null> {
+	const [row] = await db
+		.select({ cachedAt: s.storyDataCache.cachedAt })
+		.from(s.storyDataCache)
+		.where(eq(s.storyDataCache.storyId, storyId))
+		.execute();
+	return row?.cachedAt ?? null;
+}
+
+export async function getStoryQueryDataByStoryIds(
+	storyIds: string[],
+): Promise<Map<string, DBStoryDataCache['queryData']>> {
+	if (storyIds.length === 0) {
+		return new Map();
+	}
+	const rows = await db
+		.select({ storyId: s.storyDataCache.storyId, queryData: s.storyDataCache.queryData })
+		.from(s.storyDataCache)
+		.where(inArray(s.storyDataCache.storyId, storyIds))
+		.execute();
+	return new Map(rows.map((row) => [row.storyId, row.queryData]));
+}
+
 export async function upsertStoryDataCache(
 	chatId: string,
 	slug: string,
@@ -597,7 +688,7 @@ export async function upsertStoryDataCacheByStoryId(
 export async function getSqlQueriesFromCode(
 	chatId: string,
 	code: string,
-): Promise<Record<string, { sqlQuery: string; databaseId?: string; adminMode: boolean }>> {
+): Promise<Record<string, executeSqlQueries.StoredSqlQuery>> {
 	const queryIds = extractQueryIds(code);
 	if (queryIds.size === 0) {
 		return {};

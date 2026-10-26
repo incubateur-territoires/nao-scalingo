@@ -5,7 +5,7 @@ import { useEffect } from 'react';
 
 import type { UserGroupEditorTab } from '@/components/settings/user-group-editor';
 import { UserGroupEditor } from '@/components/settings/user-group-editor';
-import { requireAdmin } from '@/lib/require-admin';
+import { requireAdmin } from '@/lib/route-guards';
 import { trpc } from '@/main';
 
 export const Route = createFileRoute('/_sidebar-layout/settings/project/user-groups/$groupId')({
@@ -86,5 +86,14 @@ function UserGroupDetailPage() {
 }
 
 function isUserGroupEditorTab(value: unknown): value is UserGroupEditorTab {
-	return value === 'features' || value === 'context' || value === 'security' || value === 'budget' || value === 'sso';
+	return (
+		value === 'features' ||
+		value === 'context' ||
+		value === 'mcp' ||
+		value === 'skills' ||
+		value === 'security' ||
+		value === 'budget' ||
+		value === 'advanced' ||
+		value === 'sso'
+	);
 }

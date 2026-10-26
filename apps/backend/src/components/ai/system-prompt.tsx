@@ -6,7 +6,7 @@ import type { InternalSkill } from '../../agents/skills';
 import { listInternalSkills } from '../../agents/skills';
 import { Block, Bold, Br, CodeBlock, Link, List, ListItem, Location, Span, Title } from '../../lib/markdown';
 import type { SandboxSecretDefinition } from '../../services/sandbox-secret.service';
-import type { Skill } from '../../services/skill';
+import type { PreloadedSkill, Skill } from '../../services/skill';
 import { tokenCounter } from '../../services/token-counter';
 import type { UserMemory } from '../../types/memory';
 import { MEMORY_CATEGORIES, MemoryCategory } from '../../types/memory';
@@ -28,6 +28,8 @@ type SystemPromptProps = {
 	connections?: Connection[];
 	configuredDatabases?: ConfiguredDatabase[];
 	skills?: Skill[];
+	/** Project skills injected in full; they are left out of the regular skills listing. */
+	preloadedSkills?: PreloadedSkill[];
 	/** Defaults to every skill nao ships; only tests pass this. */
 	internalSkills?: InternalSkill[];
 	customCharts?: ChartPluginManifestEntry[];
@@ -64,6 +66,7 @@ export function SystemPrompt({
 	connections = [],
 	configuredDatabases = [],
 	skills = [],
+	preloadedSkills = [],
 	internalSkills = listInternalSkills(),
 	customCharts = [],
 	mcpServers = [],
@@ -82,6 +85,7 @@ export function SystemPrompt({
 	const visibleMemories = getMemoriesInTokenRange(memories, MEMORY_TOKEN_LIMIT);
 	const dialectToolCallRules = getDialectToolCallRules(connections);
 	const dialectSqlQueryRules = getDialectSqlQueryRules(connections);
+	const listedSkills = excludePreloadedSkills(skills, preloadedSkills);
 
 	return (
 		<Block>
@@ -117,6 +121,20 @@ export function SystemPrompt({
 				<ListItem>
 					<Bold>Direct Communication</Bold>: Avoid stating obvious facts, unnecessary explanations, or
 					conversation fillers. Jump straight to providing value.
+				</ListItem>
+			</List>
+			<Title level={2}>Multi-step requests</Title>
+			<List>
+				<ListItem>
+					<Bold>Headline first</Bold>: when a request needs a main figure plus refinements (sensitivity
+					variants, alternative thresholds, breakdowns), compute the main figure first and post it as text
+					before starting on the refinements. The user should never wait for every variant to see the answer
+					they asked for.
+				</ListItem>
+				<ListItem>
+					<Bold>Recap from what is established</Bold>: when the user asks for a recap, a status, or where
+					things stand mid-task, answer from the results already in the conversation. Do not launch new
+					queries or exploration to answer a recap; say what is done, what is pending, and the figures so far.
 				</ListItem>
 			</List>
 			<Title level={2}>Tool Calls</Title>
@@ -158,12 +176,15 @@ export function SystemPrompt({
 						: []),
 					hasTool('suggest_follow_ups') && (
 						<ListItem>
-							Call <Bold>suggest_follow_ups</Bold> once, as the very last tool of your turn, after your
-							answer is complete. Right before calling it, close your visible reply with one short,
-							friendly sentence that points the user to the suggestions shown below your message (e.g.
-							"Pick one of the suggestions below to keep going, or ask me anything else."), so they know
-							they can click one to continue. That sentence must be part of your message to the user,
-							never a note to yourself or part of your thinking.
+							For every analytical response based on business data—including trends, comparisons,
+							anomalies, causes, breakdowns, or analysis across multiple metrics, customers, or time
+							periods—call <Bold>suggest_follow_ups</Bold> exactly once. A complete answer is not a reason
+							to omit it: suggestions should extend the analysis, not complete the answer. Skip it only
+							for simple one-fact answers, acknowledgements, and clarification requests. The turn must
+							also contain a complete visible answer; the answer and tool call may occur in either order.
+							Call it only after all data gathering is complete, as the sole and final tool call, never in
+							parallel with another tool. The interface presents the suggestions separately, so do not
+							announce them in the visible answer.
 						</ListItem>
 					),
 					...dialectToolCallRules,
@@ -336,13 +357,15 @@ export function SystemPrompt({
 					<ConfiguredDatabasesBlock databases={configuredDatabases} />
 				)}
 
-				{skills.length > 0 && (
+				{preloadedSkills.length > 0 && <PreloadedSkillsBlock skills={preloadedSkills} />}
+
+				{listedSkills.length > 0 && (
 					<Block>
 						<Title level={2}>Skills</Title>
 						<Span>
 							You have access to pre-defined skills. Use these as guidance for relevant questions.
 						</Span>
-						{skills.map((skill) => (
+						{listedSkills.map((skill) => (
 							<>
 								<Title level={3}>Skill: {skill.name.trim()}</Title>
 								<Span>
@@ -395,6 +418,31 @@ function formatConfiguredDatabaseDetails(database: ConfiguredDatabase): string {
 	].filter((detail): detail is string => detail !== null);
 
 	return details.length > 0 ? ` — ${details.join(', ')}` : '';
+}
+
+function excludePreloadedSkills(skills: Skill[], preloadedSkills: PreloadedSkill[]): Skill[] {
+	const preloadedNames = new Set(preloadedSkills.map((skill) => skill.name));
+	return skills.filter((skill) => !preloadedNames.has(skill.name));
+}
+
+function PreloadedSkillsBlock({ skills }: { skills: PreloadedSkill[] }) {
+	return (
+		<Block>
+			<Title level={2}>Preloaded Skills</Title>
+			<Span>
+				These project skills are already loaded below. Follow them whenever they are relevant. Very long skills
+				are truncated, so read a skill's file directly only when you need a part that is missing. Never call{' '}
+				<Bold>load_skill</Bold> for them.
+			</Span>
+			{skills.map((skill) => (
+				<>
+					<Title level={3}>Skill: {skill.name.trim()}</Title>
+					<Location>{skill.location}</Location>
+					<Span>{skill.content.trim()}</Span>
+				</>
+			))}
+		</Block>
+	);
 }
 
 /**
@@ -614,7 +662,14 @@ function LocalDatabaseBlock({
 				</ListItem>
 				<ListItem>
 					<Bold>Join the two.</Bold> A file joined to a query result is the point of this database: an
-					uploaded list of accounts against warehouse revenue, a budget spreadsheet against actuals.
+					uploaded list of accounts against warehouse revenue, a budget spreadsheet against actuals.{' '}
+					<Bold>
+						{
+							"SELECT q.region, q.revenue, f.budget FROM query_ab12cd34 AS q JOIN read_xlsx('/home/uploads/2026-01-31/budget.xlsx', sheet = 'FY26') AS f ON q.region = f.region"
+						}
+					</Bold>
+					. The table name is the query id exactly as the <Bold>Query ID</Bold> line of the tool output spells
+					it, never the name you gave the query.
 				</ListItem>
 			</List>
 			{canSaveResults && (
@@ -639,7 +694,9 @@ function LocalDatabaseBlock({
 			<Span>
 				It is DuckDB, so write DuckDB SQL. The query itself only reads: writing a file is what{' '}
 				{canSaveResults ? <Bold>save_to</Bold> : 'the write tool'} is for, and a <Bold>COPY … TO</Bold> in the
-				SQL is rejected. It sees only the user's own saved files and the project folder.{' '}
+				SQL is rejected. It sees only the user's own saved files under <Bold>/home</Bold> and the project
+				folder: a remote URL (http, https, s3) is not readable, so a file the user links to has to be uploaded
+				first.{' '}
 				{warehouseSqlEnabled
 					? 'For questions a warehouse can answer on its own, keep using the warehouse — this is for files and for results you already have.'
 					: 'It holds no warehouse data of its own: get the numbers from execute_semantic_query first, then reshape them here.'}

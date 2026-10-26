@@ -10,7 +10,7 @@ import fastifyRawBody from 'fastify-raw-body';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 
 import { env, isCloud, isCloudBillingEnabled } from './env';
-import { AUTOMATION_JOB_NAME, automationHandler } from './handlers/automation.handler';
+import { AUTOMATION_JOB_NAME, automationHandler, resolveAutomationProjectId } from './handlers/automation.handler';
 import { BILLING_LIFECYCLE_JOB_NAME, billingLifecycleHandler } from './handlers/billing-lifecycle.handler';
 import {
 	CONTEXT_BRANCH_CLEANUP_JOB_NAME,
@@ -20,6 +20,7 @@ import {
 	CONTEXT_RECOMMENDATIONS_JOB_NAME,
 	contextRecommendationsHandler,
 	ensureContextRecommendationsSchedules,
+	resolveContextRecommendationsProjectId,
 } from './handlers/context-recommendations.handler';
 import {
 	INVITATION_CLEANUP_JOB_NAME,
@@ -29,8 +30,16 @@ import {
 import { LOG_CLEANUP_JOB_NAME, logCleanupHandler, runLogCleanup } from './handlers/log-cleanup.handler';
 import { MCP_QUERY_DATA_CLEANUP_JOB_NAME, mcpQueryDataCleanupHandler } from './handlers/mcp-query-data-cleanup.handler';
 import { STORY_BLOB_CLEANUP_JOB_NAME, storyBlobCleanupHandler } from './handlers/story-blob-cleanup.handler';
-import { STORY_DELIVERY_JOB_NAME, storyDeliveryHandler } from './handlers/story-delivery.handler';
-import { STORY_REFRESH_JOB_NAME, storyRefreshHandler } from './handlers/story-refresh.handler';
+import {
+	resolveStoryDeliveryProjectId,
+	STORY_DELIVERY_JOB_NAME,
+	storyDeliveryHandler,
+} from './handlers/story-delivery.handler';
+import {
+	resolveStoryRefreshProjectId,
+	STORY_REFRESH_JOB_NAME,
+	storyRefreshHandler,
+} from './handlers/story-refresh.handler';
 import { STRIPE_WEBHOOK_PROCESS_JOB_NAME, stripeWebhookProcessHandler } from './handlers/stripe-webhook.handler';
 import { flushTelemetry } from './instrumentation';
 import { mcpServerRoutes } from './mcp/routes';
@@ -46,6 +55,7 @@ import { brandingRoutes } from './routes/branding';
 import { chartRoutes } from './routes/chart';
 import { cliAuthRoutes } from './routes/cli-auth';
 import { deployRoutes } from './routes/deploy';
+import { discordRoutes } from './routes/discord';
 import { embedStoryDownloadRoutes } from './routes/embed-story-download';
 import { githubRoutes } from './routes/github';
 import { gitlabRoutes } from './routes/gitlab';
@@ -56,11 +66,14 @@ import { mcpOAuthRoutes } from './routes/mcp-oauth';
 import { notificationUnsubscribeRoutes } from './routes/notification-unsubscribe';
 import { slackRoutes } from './routes/slack';
 import { ssoRoutes } from './routes/sso';
+import { storyThumbnailRoutes } from './routes/story-thumbnail';
 import { stripeWebhookRoutes } from './routes/stripe-webhook';
 import { teamsRoutes } from './routes/teams';
 import { telegramRoutes } from './routes/telegram';
 import { testRoutes } from './routes/test';
 import { whatsappRoutes } from './routes/whatsapp';
+import { discordService } from './services/discord';
+import { ensureSystemExampleProject } from './services/example-project';
 import { startLicenseHeartbeat } from './services/license.service';
 import { logLicenseStatus } from './services/license-startup';
 import { mattermostService } from './services/mattermost';
@@ -70,11 +83,12 @@ import { ensureRecurring, registerJob, startScheduler, stopScheduler } from './s
 import { slackService } from './services/slack';
 import { seedSlackConfigFromEnv } from './services/slack-env-seed';
 import { validateCloudBillingConfiguration } from './services/stripe.service';
+import { startWarehouseProvisioningReconciler } from './services/warehouse-provisioning';
 import { TrpcRouter, trpcRouter } from './trpc/router';
 import { createContext } from './trpc/trpc';
 import { BudgetExceededError, HandlerError } from './utils/error';
 import { closeBrowser } from './utils/headless-browser';
-import { logger } from './utils/logger';
+import { describeError, logger } from './utils/logger';
 import { drainInFlightRequests, isDraining, trackInFlightRequests } from './utils/request-drain';
 import { FRONTEND_DEV_ORIGIN, staticRoot } from './utils/static-root';
 
@@ -112,12 +126,11 @@ trackInFlightRequests(app);
 
 // Map HandlerError to HTTP status code
 app.setErrorHandler((error, request, reply) => {
-	const message = error instanceof Error ? error.message : String(error);
 	const statusCode =
 		typeof (error as Record<string, unknown>).statusCode === 'number'
 			? (error as Record<string, unknown>).statusCode
 			: undefined;
-	logger.error(message, {
+	logger.error(describeError(error), {
 		source: 'http',
 		context: { method: request.method, url: request.url, statusCode },
 	});
@@ -167,7 +180,7 @@ app.register(fastifyTRPCPlugin, {
 		router: trpcRouter,
 		createContext,
 		onError({ path, error }) {
-			logger.error(`tRPC error on ${path}: ${error.message}`, {
+			logger.error(`tRPC error on ${path}: ${describeError(error)}`, {
 				source: 'http',
 				context: { path, code: error.code },
 			});
@@ -219,6 +232,10 @@ app.register(embedStoryDownloadRoutes, {
 	prefix: '/api/embed',
 });
 
+app.register(storyThumbnailRoutes, {
+	prefix: '/api/stories',
+});
+
 app.register(notificationUnsubscribeRoutes, {
 	prefix: '/api/notifications',
 });
@@ -245,6 +262,10 @@ app.register(telegramRoutes, {
 
 app.register(mattermostRoutes, {
 	prefix: '/api/webhooks/mattermost',
+});
+
+app.register(discordRoutes, {
+	prefix: '/api/webhooks/discord',
 });
 
 app.register(whatsappRoutes, {
@@ -407,10 +428,21 @@ app.setNotFoundHandler((request, reply) => {
 });
 
 export const startServer = async (opts: { port: number; host: string }) => {
-	if (isCloudBillingEnabled()) {
-		await validateCloudBillingConfiguration();
-	}
-	if (!isCloud) {
+	if (isCloud) {
+		if (isCloudBillingEnabled()) {
+			await validateCloudBillingConfiguration();
+		}
+		try {
+			await ensureSystemExampleProject();
+		} catch (err) {
+			logger.error(
+				`Failed to ensure system example project: ${err instanceof Error ? err.message : String(err)}`,
+				{
+					source: 'system',
+				},
+			);
+		}
+	} else {
 		await ensureOrganizationSetup();
 	}
 	await logLicenseStatus();
@@ -434,9 +466,9 @@ export const startServer = async (opts: { port: number; host: string }) => {
 		uniqueKey: INVITATION_CLEANUP_JOB_NAME,
 	});
 
-	registerJob(AUTOMATION_JOB_NAME, automationHandler);
-	registerJob(STORY_REFRESH_JOB_NAME, storyRefreshHandler);
-	registerJob(STORY_DELIVERY_JOB_NAME, storyDeliveryHandler);
+	registerJob(AUTOMATION_JOB_NAME, automationHandler, { resolveProjectId: resolveAutomationProjectId });
+	registerJob(STORY_REFRESH_JOB_NAME, storyRefreshHandler, { resolveProjectId: resolveStoryRefreshProjectId });
+	registerJob(STORY_DELIVERY_JOB_NAME, storyDeliveryHandler, { resolveProjectId: resolveStoryDeliveryProjectId });
 	if (isCloudBillingEnabled()) {
 		// Process accepted webhooks in the background so Stripe receives an immediate response.
 		registerJob(STRIPE_WEBHOOK_PROCESS_JOB_NAME, stripeWebhookProcessHandler);
@@ -470,7 +502,9 @@ export const startServer = async (opts: { port: number; host: string }) => {
 	});
 
 	if (env.BETA_CONTEXT_RECOMMENDATIONS_ENABLED) {
-		registerJob(CONTEXT_RECOMMENDATIONS_JOB_NAME, contextRecommendationsHandler);
+		registerJob(CONTEXT_RECOMMENDATIONS_JOB_NAME, contextRecommendationsHandler, {
+			resolveProjectId: resolveContextRecommendationsProjectId,
+		});
 		try {
 			await ensureContextRecommendationsSchedules();
 		} catch (err) {
@@ -486,10 +520,12 @@ export const startServer = async (opts: { port: number; host: string }) => {
 
 	const address = await app.listen({ host: opts.host, port: opts.port });
 	app.log.info(`Server is running on ${address}`);
+	startWarehouseProvisioningReconciler();
 
 	void pingLicensesServer();
 	void seedSlackConfigFromEnv().then(() => slackService.startSocketModeForAllProjects());
 	void mattermostService.startForAllProjects();
+	void discordService.startForAllProjects();
 
 	posthog.capture(undefined, PostHogEvent.ServerStarted, { ...opts, address });
 
