@@ -1,10 +1,12 @@
 import { type BackgroundModelCategory, type DefaultModelSettings, selectBackgroundModel } from '@nao/shared';
 import { type LlmProvider, type LlmSelectedModel, providerKind } from '@nao/shared/types';
 
+import { managedAiSource, type ManagedAiUsageContext } from '../agents/managed-ai';
 import {
 	createProviderModel,
 	getDefaultModelId,
 	getProviderMeta,
+	isManagedProvider,
 	LLM_PROVIDERS,
 	type ProviderModelResult,
 } from '../agents/providers';
@@ -25,7 +27,8 @@ export { getDefaultModelId };
 
 /** Get the API key from environment for a provider */
 export function getEnvApiKey(provider: LlmProvider): string | undefined {
-	return process.env[getProviderMeta(provider).envVar];
+	const { envVar } = getProviderMeta(provider);
+	return envVar ? process.env[envVar] : undefined;
 }
 
 /** Get the base URL from environment for a provider (e.g. OPENAI_BASE_URL) */
@@ -109,7 +112,7 @@ export async function resolveProviderSettings(
 	if (isProviderDisabled(provider)) {
 		return null;
 	}
-	for (const source of MODEL_SOURCES) {
+	for (const source of getSourcesServing(provider)) {
 		const settings = await source.resolveSettings?.(projectId, provider);
 		if (settings) {
 			return settings;
@@ -119,20 +122,27 @@ export async function resolveProviderSettings(
 }
 
 /**
- * Resolve a provider model from the first model source that has credentials for it: DB config,
- * then nao_config.yaml, then env vars. Returns null when no source has credentials for the provider.
+ * Resolve a provider model from the first model source that serves it: DB config, nao_config.yaml,
+ * env vars, then nao's managed models. Returns null when no source has credentials for the provider.
  */
 export async function resolveProviderModel(
 	projectId: string,
 	provider: LlmProvider,
 	modelId: string,
 	applyUserSettings = true,
+	usageContext?: ManagedAiUsageContext,
 ): Promise<ProviderModelResult | null> {
 	if (isProviderDisabled(provider)) {
 		return null;
 	}
-	const request: ModelRequest = { projectId, provider, modelId, applyUserSettings };
-	for (const source of MODEL_SOURCES) {
+	const request: ModelRequest = {
+		projectId,
+		provider,
+		modelId,
+		applyUserSettings,
+		usageContext,
+	};
+	for (const source of getSourcesServing(provider)) {
 		const result = await source.resolveModel(request);
 		if (result) {
 			return result;
@@ -418,19 +428,36 @@ export const getProjectModelNameResolver = async (
 
 /**
  * The model list of every provider available to a project, taking each provider from the first
- * source that declares it: the database, then nao_config.yaml, then the environment.
+ * source that declares it.
  */
 async function getProjectModelSources(projectId: string): Promise<ProviderModelSource[]> {
+	const [ownProviders, managedProviders] = await Promise.all([
+		collectProviders(projectId, { managed: false }),
+		collectProviders(projectId, { managed: true }),
+	]);
+	return [...ownProviders, ...managedProviders];
+}
+
+async function collectProviders(projectId: string, { managed }: { managed: boolean }): Promise<ProviderModelSource[]> {
 	const collected: ProviderModelSource[] = [];
-	for (const source of MODEL_SOURCES) {
+	for (const source of getModelSources().filter((candidate) => Boolean(candidate.managed) === managed)) {
 		for (const entry of await source.listProviders(projectId)) {
 			const isFirstDeclaration = !collected.some((existing) => existing.provider === entry.provider);
-			if (isFirstDeclaration && !isProviderDisabled(entry.provider)) {
+			if (isFirstDeclaration && servesProvider(source, entry.provider) && !isProviderDisabled(entry.provider)) {
 				collected.push(entry);
 			}
 		}
 	}
 	return collected;
+}
+
+function getSourcesServing(provider: LlmProvider): ModelSource[] {
+	return getModelSources().filter((source) => servesProvider(source, provider));
+}
+
+/** Managed providers run on nao's own keys, so only managed sources serve them. */
+function servesProvider(source: ModelSource, provider: LlmProvider): boolean {
+	return Boolean(source.managed) === isManagedProvider(provider);
 }
 
 const getModelName = (provider: LlmProvider, modelId: string): string =>
@@ -522,4 +549,7 @@ const envSource = credentialSource({
 	},
 });
 
-const MODEL_SOURCES: ModelSource[] = [projectConfigSource, naoConfigFileSource, envSource];
+/** Built on call: `managed-ai` imports this module back through the project queries, so it may not be loaded yet. */
+function getModelSources(): ModelSource[] {
+	return [projectConfigSource, naoConfigFileSource, envSource, managedAiSource];
+}

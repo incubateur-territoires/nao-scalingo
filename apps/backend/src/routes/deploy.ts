@@ -10,6 +10,7 @@ import { env } from '../env';
 import { ensureContextRecommendationsScheduleForNewProject } from '../handlers/context-recommendations.handler';
 import * as projectQueries from '../queries/project.queries';
 import { validateApiKey } from '../services/api-key.service';
+import { createProject, touchProjectUpdatedAt } from '../services/project.service';
 
 export const deployRoutes = async (app: App) => {
 	app.post('/deploy', async (request, reply) => {
@@ -18,10 +19,12 @@ export const deployRoutes = async (app: App) => {
 			return reply.status(401).send({ error: 'Missing or invalid Authorization header' });
 		}
 
-		const org = await validateApiKey(authHeader.slice(7));
-		if (!org) {
+		const apiKey = await validateApiKey(authHeader.slice(7));
+		if (!apiKey) {
 			return reply.status(401).send({ error: 'Invalid API key' });
 		}
+		request.actorUserId = apiKey.createdBy;
+		const org = apiKey.organization;
 
 		const file = await request.file();
 		if (!file) {
@@ -74,14 +77,14 @@ export const deployRoutes = async (app: App) => {
 				}
 				fs.mkdirSync(existing.path!, { recursive: true });
 				copyDirectoryContents(extractDir, existing.path!);
-				await projectQueries.touchProjectUpdatedAt(projectId);
+				await touchProjectUpdatedAt(projectId);
 			} else {
 				const projectId_ = crypto.randomUUID();
 				const projectDir = path.resolve(env.NAO_PROJECTS_DIR, projectId_);
 				fs.mkdirSync(projectDir, { recursive: true });
 				copyDirectoryContents(extractDir, projectDir);
 
-				const project = await projectQueries.createProject({
+				const project = await createProject({
 					name: projectName,
 					type: 'local',
 					path: projectDir,

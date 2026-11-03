@@ -1,14 +1,39 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback, useId } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link, useNavigate } from '@tanstack/react-router';
-import { useQuery } from '@tanstack/react-query';
-import { Plus, PencilRuler, Database, Paperclip, AlertTriangle, Shield, Check } from 'lucide-react';
-import { ATTACHMENT_ACCEPT } from '@nao/shared/attachments';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+	Plus,
+	PencilRuler,
+	Database,
+	Library,
+	Paperclip,
+	AlertTriangle,
+	Shield,
+	Check,
+	MessageCircleOff,
+	LockKeyhole,
+} from 'lucide-react';
+import { ALLOWED_IMAGE_MEDIA_TYPES, ATTACHMENT_ACCEPT } from '@nao/shared/attachments';
+import { toStoryReferenceMentionId } from '@nao/shared';
+import { story } from '@nao/shared/tools';
 import { Button, ChatButton, MicButton } from './ui/button';
 import { SlidingWaveform } from './chat-input-sliding-waveform';
-import { ChatPrompt, DATABASE_MENTION_TRIGGER, useStoryMentionOptions } from './chat-input-prompt';
+import {
+	ChatPrompt,
+	DATABASE_MENTION_TRIGGER,
+	openMentionMenuAtEnd,
+	openReferenceMenuAtEnd,
+	SKILL_MENTION_TRIGGER,
+	STORY_REFERENCE_MENTION_TRIGGER,
+	useStoryMentionOptions,
+	useStoryReferenceOptions,
+} from './chat-input-prompt';
+import { ChatInputAnimatedBorder } from './chat-input-animated-border';
 import { ChatInputModelSelect } from './chat-input-model-select';
 import { ChatInputMessageQueue } from './chat-input-message-queue';
 import { ChatInputAttachmentPreview } from './chat-input-attachment-preview';
+import { ManagedCreditsExhausted } from './managed-credits-exhausted';
+import { ContactSupportButton } from './contact-support-dialog';
 import {
 	DropdownMenu,
 	DropdownMenuContent,
@@ -19,33 +44,51 @@ import {
 import type { MentionOption, PromptHandle, SelectedMention } from 'prompt-mentions';
 import type { FormEvent } from 'react';
 import type { AgentHelpers } from '@/hooks/use-agent';
+import type { ChatAllowanceExhaustedScope } from '@/lib/ai';
+import type { StoryReferences } from '@/lib/story-reference';
 import { ContextWindowRing } from '@/components/ui/chat-input-context-window-ring';
 import { SimpleTooltip } from '@/components/ui/tooltip';
 
 import { InputGroup, InputGroupAddon } from '@/components/ui/input-group';
+import { Callout } from '@/components/ui/callout';
 import { trpc } from '@/main';
 import { useAgentContext, useAgentMessagesSelector } from '@/contexts/agent.provider';
 import { useRegisterSetChatInputCallback } from '@/contexts/set-chat-input-callback';
 import { useTranscribe } from '@/hooks/use-transcribe';
 import { useAttachmentUpload } from '@/hooks/use-attachment-upload';
-import { parseBudgetError } from '@/lib/ai';
+import {
+	hasManagedCreditsForRequest,
+	parseBudgetError,
+	parseChatAllowanceExhaustedError,
+	parseManagedCreditsError,
+} from '@/lib/ai';
 import { cn } from '@/lib/utils';
 import { useChatId } from '@/hooks/use-chat-id';
 import { useModelSelection } from '@/hooks/use-model-selection';
 import { usePermissions } from '@/hooks/use-permissions';
 import { getShortcut } from '@/lib/keyboard-shortcuts';
 import { matchesShortcut } from '@/lib/platform';
+import {
+	STORIES_ROOT_ID,
+	TABLES_ROOT_ID,
+	toStoryFolderReferenceOption,
+	toStoryReferenceOption,
+} from '@/lib/reference-mention-menu';
+import { hasAnyStoryReference, mayCarryStories, readDroppedReferences } from '@/lib/story-reference';
+import { takePendingStoryReferences, usePendingStoryReferences } from '@/stores/story-references';
 import { messageQueueStore } from '@/stores/chat-message-queue';
 import { chatInputRestoreStore, useChatInputRestore } from '@/stores/chat-input-restore';
 import { chatPendingCitationStore } from '@/stores/chat-pending-citation';
 import { useChatPendingCitation } from '@/hooks/use-chat-pending-citation';
 import { useEffectiveUserGroupFeatures } from '@/hooks/use-effective-user-group-features';
 import { SelectionCitationBanner } from '@/components/selection-citation-banner';
-import { ChatInputSuggestions } from '@/components/chat-input-suggestions';
+import { ChatInputSuggestions, SuggestionCard } from '@/components/chat-input-suggestions';
 import { runWithStoryBeforeAgentSend, useStoryBeforeAgentSend } from '@/contexts/story-before-agent-send';
 import { useIsCloud } from '@/hooks/use-nao-mode';
 
 const cycleModelShortcut = getShortcut('cycle-model').shortcut;
+const TRIAL_ATTACHMENT_ACCEPT = ALLOWED_IMAGE_MEDIA_TYPES.join(',');
+const TRIAL_DOCUMENTS_DISABLED_REASON = 'Documents can be attached once your project is set up. Images work now.';
 
 type ChatInputVariant = 'default' | 'onboarding';
 
@@ -58,6 +101,7 @@ type ChatInputBaseProps = {
 	onCancel?: () => void;
 	onSubmitMessage: AgentHelpers['queueOrSendMessage'];
 	allowQueueing?: boolean;
+	acceptsPendingStoryReferences?: boolean;
 };
 
 type ChatInputInlineProps = {
@@ -67,7 +111,13 @@ type ChatInputInlineProps = {
 	onSubmitMessage: AgentHelpers['queueOrSendMessage'];
 };
 
-export function ChatInput({ variant = 'default' }: { variant?: ChatInputVariant }) {
+export function ChatInput({
+	variant = 'default',
+	acceptsPendingStoryReferences = false,
+}: {
+	variant?: ChatInputVariant;
+	acceptsPendingStoryReferences?: boolean;
+}) {
 	const promptRef = useRef<PromptHandle>(null);
 	const { queueOrSendMessage } = useAgentContext();
 
@@ -79,7 +129,15 @@ export function ChatInput({ variant = 'default' }: { variant?: ChatInputVariant 
 		requestAnimationFrame(() => promptRef.current?.focus());
 	});
 
-	return <ChatInputBase promptRef={promptRef} variant={variant} onSubmitMessage={queueOrSendMessage} allowQueueing />;
+	return (
+		<ChatInputBase
+			promptRef={promptRef}
+			variant={variant}
+			onSubmitMessage={queueOrSendMessage}
+			allowQueueing
+			acceptsPendingStoryReferences={acceptsPendingStoryReferences}
+		/>
+	);
 }
 
 export function ChatInputInline({ className, initialText, onCancel, onSubmitMessage }: ChatInputInlineProps) {
@@ -100,13 +158,16 @@ function ChatInputBase({
 	promptRef,
 	className,
 	variant = 'default',
-	placeholder = 'Ask anything about your data...',
+	placeholder,
 	initialText,
 	onCancel,
 	onSubmitMessage,
 	allowQueueing,
+	acceptsPendingStoryReferences = false,
 }: ChatInputBaseProps) {
 	const [inputText, setInputText] = useState('');
+	const [managedCreditDialogOpen, setManagedCreditDialogOpen] = useState(false);
+	const [verifiedManagedCreditError, setVerifiedManagedCreditError] = useState<Error>();
 	const {
 		isRunning,
 		cancelAgent,
@@ -116,13 +177,17 @@ function ChatInputBase({
 		setMentions,
 		submitQueuedMessageNow,
 		error,
+		clearError,
 		selectedModel,
 		mode,
 	} = useAgentContext();
 	const navigate = useNavigate();
-	const { canChatWithNaoData } = usePermissions();
+	const { canChatWithNaoData, isAdmin, isOrgAdmin } = usePermissions();
 	const { storyCreationEnabled } = useEffectiveUserGroupFeatures();
 	const storyMentionOptions = useStoryMentionOptions(storyCreationEnabled);
+	const { options: storyReferenceOptions, isLoaded: areReferenceableStoriesLoaded } = useStoryReferenceOptions({
+		excludeCurrentChat: true,
+	});
 	const chatId = useChatId();
 	const storyBeforeAgentSend = useStoryBeforeAgentSend();
 
@@ -140,33 +205,97 @@ function ChatInputBase({
 	}, [adminModeLocked, isAdminMode, setAdminMode, navigate]);
 	const { canCycleModels, cycleModel } = useModelSelection();
 	const project = useQuery(trpc.project.getCurrent.queryOptions());
+	const hasProject = project.data != null;
 	const isTrial = useIsCloud() && project.data === null;
-	const uploadLimits = useQuery(trpc.storage.getUploadLimits.queryOptions());
+	const uploadLimits = useQuery({
+		...trpc.storage.getUploadLimits.queryOptions(),
+		enabled: hasProject,
+	});
 	const attachmentUpload = useAttachmentUpload({
-		documentsEnabled: uploadLimits.data?.enabled,
+		documentsEnabled: isTrial ? false : uploadLimits.data?.enabled,
+		documentsDisabledReason: isTrial ? TRIAL_DOCUMENTS_DISABLED_REASON : undefined,
 		maxDocumentSizeMb: uploadLimits.data?.maxFileSizeMb ?? 0,
-		disabled: isTrial,
 	});
 	const chatInputRestore = useChatInputRestore(!!allowQueueing);
-	const effectivePlaceholder =
-		isRunning && allowQueueing
-			? 'Add a follow-up...'
-			: variant === 'onboarding'
-				? 'Tell me where you are starting from...'
-				: placeholder;
 
-	const agentSettings = useQuery(trpc.project.getAgentSettings.queryOptions());
-	const transcribeModels = useQuery(trpc.project.getKnownTranscribeModels.queryOptions());
-	const isTranscribeEnabled = agentSettings.data?.transcribe?.enabled ?? false;
+	const agentSettings = useQuery({
+		...trpc.project.getAgentSettings.queryOptions(),
+		enabled: hasProject,
+	});
+	const transcribeModels = useQuery({
+		...trpc.project.getKnownTranscribeModels.queryOptions(),
+		enabled: hasProject,
+	});
+	const isTranscribeEnabled = hasProject && (agentSettings.data?.transcribe?.enabled ?? false);
 	const hasTranscribeProvider = Object.values(transcribeModels.data ?? {}).some((p) => p.hasKey);
 	const isTranscribeReady = isTranscribeEnabled && hasTranscribeProvider;
 
 	const budgetStatus = useQuery({
 		...trpc.budget.checkBudgetStatus.queryOptions({ provider: selectedModel?.provider ?? 'openai' }),
-		enabled: !!selectedModel?.provider,
+		enabled: hasProject && !!selectedModel?.provider && selectedModel.provider !== 'nao',
 		refetchOnWindowFocus: false,
 	});
-	const isBudgetExceeded = !!parseBudgetError(error) || budgetStatus.data?.level === 'exceeded';
+	const managedCreditError = parseManagedCreditsError(error);
+	const requiredBalanceMicroUsd = managedCreditError?.requiredBalanceMicroUsd;
+	const isManagedModel = selectedModel?.provider === 'nao';
+	const managedCredit = useQuery({
+		...trpc.account.getManagedCreditStatus.queryOptions(),
+		enabled: hasProject && isManagedModel,
+		refetchInterval: requiredBalanceMicroUsd ? 5_000 : false,
+		refetchOnWindowFocus: 'always',
+	});
+	const refetchManagedCredit = managedCredit.refetch;
+	const currentBalanceMicroUsd = managedCredit.data?.balanceMicroUsd;
+	const hasVerifiedManagedCreditBalance = verifiedManagedCreditError === error;
+	const isManagedCreditsBlocked =
+		isManagedModel &&
+		(managedCredit.data?.hasCredits === false ||
+			(requiredBalanceMicroUsd !== undefined &&
+				(!hasVerifiedManagedCreditBalance ||
+					!hasManagedCreditsForRequest(currentBalanceMicroUsd, requiredBalanceMicroUsd))));
+	const allowanceExhaustedScope = hasProject ? null : parseChatAllowanceExhaustedError(error);
+	const isSendBlocked =
+		!!parseBudgetError(error) ||
+		!!allowanceExhaustedScope ||
+		(hasProject && budgetStatus.data?.level === 'exceeded') ||
+		isManagedCreditsBlocked;
+
+	useEffect(() => {
+		if (!error || !isManagedModel || requiredBalanceMicroUsd === undefined) {
+			return;
+		}
+		let cancelled = false;
+		setVerifiedManagedCreditError(undefined);
+		setManagedCreditDialogOpen(true);
+		void refetchManagedCredit().then(({ data, isSuccess }) => {
+			if (cancelled) {
+				return;
+			}
+			if (isSuccess && hasManagedCreditsForRequest(data?.balanceMicroUsd, requiredBalanceMicroUsd)) {
+				setManagedCreditDialogOpen(false);
+				clearError();
+				return;
+			}
+			if (isSuccess) {
+				setVerifiedManagedCreditError(error);
+			}
+		});
+		return () => {
+			cancelled = true;
+		};
+	}, [error, isManagedModel, requiredBalanceMicroUsd, refetchManagedCredit, clearError]);
+
+	useEffect(() => {
+		if (
+			!hasVerifiedManagedCreditBalance ||
+			requiredBalanceMicroUsd === undefined ||
+			!hasManagedCreditsForRequest(currentBalanceMicroUsd, requiredBalanceMicroUsd)
+		) {
+			return;
+		}
+		setManagedCreditDialogOpen(false);
+		clearError();
+	}, [hasVerifiedManagedCreditBalance, requiredBalanceMicroUsd, currentBalanceMicroUsd, clearError]);
 
 	const [micWarning, setMicWarning] = useState(false);
 	const micWarningTimer = useRef(0);
@@ -174,6 +303,68 @@ function ChatInputBase({
 	const [isDragging, setIsDragging] = useState(false);
 
 	useEffect(() => promptRef.current?.focus(), [chatId, promptRef]);
+
+	const queryClient = useQueryClient();
+	const currentProjectId = project.data?.id;
+
+	/** Stories past the referenceable list, such as older ones in a large project, are resolved one by one. */
+	const findStoryReferenceOption = useCallback(
+		async (storyId: string): Promise<MentionOption | null> => {
+			const option = storyReferenceOptions.find(
+				(storyOption) => storyOption.id === toStoryReferenceMentionId(storyId),
+			);
+			if (option) {
+				return option;
+			}
+			const resolved = await queryClient
+				.fetchQuery(trpc.story.resolve.queryOptions({ storyId }))
+				.catch(() => null);
+			return resolved &&
+				!resolved.isArchived &&
+				resolved.chatId !== chatId &&
+				resolved.projectId === currentProjectId
+				? toStoryReferenceOption(resolved)
+				: null;
+		},
+		[storyReferenceOptions, queryClient, chatId, currentProjectId],
+	);
+
+	const storyFolders = useQuery(trpc.storyFolder.listTree.queryOptions({ archived: false }));
+
+	const findFolderReferenceOption = useCallback(
+		(folderId: string): MentionOption | null => {
+			const folder = storyFolders.data?.find((storyFolder) => storyFolder.id === folderId);
+			return folder ? toStoryFolderReferenceOption(folder) : null;
+		},
+		[storyFolders.data],
+	);
+
+	const addStoryReferences = useCallback(
+		async ({ storyIds, folderIds }: StoryReferences) => {
+			const storyOptions = await Promise.all(storyIds.map(findStoryReferenceOption));
+			for (const option of [...storyOptions, ...folderIds.map(findFolderReferenceOption)]) {
+				if (option) {
+					promptRef.current?.appendMention(option, STORY_REFERENCE_MENTION_TRIGGER);
+				}
+			}
+			requestAnimationFrame(() => promptRef.current?.focus());
+		},
+		[findStoryReferenceOption, findFolderReferenceOption, promptRef],
+	);
+
+	const pendingStoryReferences = usePendingStoryReferences();
+
+	const areReferencesLoaded = areReferenceableStoriesLoaded && storyFolders.isSuccess;
+
+	useEffect(() => {
+		if (!acceptsPendingStoryReferences || !hasAnyStoryReference(pendingStoryReferences) || !areReferencesLoaded) {
+			return;
+		}
+		const references = takePendingStoryReferences();
+		if (hasAnyStoryReference(references)) {
+			addStoryReferences(references);
+		}
+	}, [acceptsPendingStoryReferences, pendingStoryReferences, areReferencesLoaded, addStoryReferences]);
 
 	useEffect(() => {
 		if (!allowQueueing || !chatInputRestore) {
@@ -214,7 +405,7 @@ function ChatInputBase({
 		const handleDragEnter = (e: DragEvent) => {
 			e.preventDefault();
 			dragCounter++;
-			if (e.dataTransfer?.types.includes('Files')) {
+			if (e.dataTransfer?.types.includes('Files') || mayCarryStories(e.dataTransfer)) {
 				setIsDragging(true);
 			}
 		};
@@ -235,6 +426,11 @@ function ChatInputBase({
 			e.preventDefault();
 			dragCounter = 0;
 			setIsDragging(false);
+			const references = readDroppedReferences(e.dataTransfer);
+			if (hasAnyStoryReference(references)) {
+				addStoryReferences(references);
+				return;
+			}
 			if (e.dataTransfer?.files) {
 				attachmentUpload.addFiles(e.dataTransfer.files);
 			}
@@ -250,7 +446,7 @@ function ChatInputBase({
 			el.removeEventListener('dragover', handleDragOver);
 			el.removeEventListener('drop', handleDrop);
 		};
-	}, [attachmentUpload.addFiles]); // eslint-disable-line
+	}, [attachmentUpload.addFiles, addStoryReferences]); // eslint-disable-line
 
 	useEffect(() => {
 		const handler = (e: ClipboardEvent) => {
@@ -302,7 +498,7 @@ function ChatInputBase({
 
 			if (
 				(isRunning && !allowQueueing) ||
-				isBudgetExceeded ||
+				isSendBlocked ||
 				attachmentUpload.isPreparing ||
 				attachmentUpload.hasErrors
 			) {
@@ -337,7 +533,7 @@ function ChatInputBase({
 			onSubmitMessage,
 			isRunning,
 			allowQueueing,
-			isBudgetExceeded,
+			isSendBlocked,
 			setMentions,
 			promptRef,
 			attachmentUpload,
@@ -373,10 +569,21 @@ function ChatInputBase({
 	const pendingCitation = useChatPendingCitation(chatId);
 	const isInputEmpty = !inputText.trim() && !attachmentUpload.hasAttachments && !pendingCitation;
 
-	const skills = useQuery(trpc.skill.list.queryOptions());
-	const databaseObjects = useQuery(trpc.project.getDatabaseObjects.queryOptions());
-	const hasSkills = Boolean(skills.data?.length);
-	const hasDatabases = Boolean(databaseObjects.data?.length);
+	const skills = useQuery({ ...trpc.skill.list.queryOptions(), enabled: hasProject });
+	const databaseObjects = useQuery({ ...trpc.project.getDatabaseObjects.queryOptions(), enabled: hasProject });
+	const hasSkills = hasProject && Boolean(skills.data?.length);
+	const hasDatabases = hasProject && Boolean(databaseObjects.data?.length);
+	const shortcutPlaceholder = buildShortcutPlaceholder({
+		hasContext: hasDatabases || storyReferenceOptions.length > 0,
+		hasSkills,
+		hasStoryMode: storyMentionOptions.length > 0,
+	});
+	const effectivePlaceholder =
+		isRunning && allowQueueing
+			? 'Add a follow-up...'
+			: variant === 'onboarding'
+				? 'Tell me where you are starting from...'
+				: (placeholder ?? shortcutPlaceholder);
 
 	const handleEditQueuedMessage = useCallback(
 		(text: string) => {
@@ -387,13 +594,23 @@ function ChatInputBase({
 		[promptRef],
 	);
 
-	const openSkillsMenu = useCallback(() => {
-		promptRef.current?.insertText('/');
-	}, [promptRef]);
+	const openMentionMenu = useCallback(
+		(trigger: string) => {
+			if (promptRef.current) {
+				openMentionMenuAtEnd(promptRef.current, trigger);
+			}
+		},
+		[promptRef],
+	);
 
-	const openDatabaseMenu = useCallback(() => {
-		promptRef.current?.insertText(DATABASE_MENTION_TRIGGER);
-	}, [promptRef]);
+	const openReferenceMenu = useCallback(
+		(rootId: string) => {
+			if (promptRef.current) {
+				openReferenceMenuAtEnd(promptRef.current, rootId);
+			}
+		},
+		[promptRef],
+	);
 
 	const handleKeyDown = useCallback(
 		(event: React.KeyboardEvent) => {
@@ -409,28 +626,54 @@ function ChatInputBase({
 
 	return (
 		<div ref={dropZoneRef} className={cn('px-3 pb-3 pt-0 md:px-3 md:pb-3 max-w-3xl w-full mx-auto', className)}>
-			<ChatInputMessageQueue onEditMessage={handleEditQueuedMessage} onSubmitNow={submitQueuedMessageWithGuard} />
-			<SelectionCitationBanner />
-			<BudgetBanner />
-			{allowQueueing && !isAdminMode && (
-				<ChatInputSuggestions
-					storyCreationEnabled={storyCreationEnabled}
-					isHidden={inputText.trim().length > 0}
-				/>
+			{allowanceExhaustedScope ? (
+				<ChatAllowanceExhausted scope={allowanceExhaustedScope} />
+			) : (
+				<>
+					<ChatInputMessageQueue
+						onEditMessage={handleEditQueuedMessage}
+						onSubmitNow={submitQueuedMessageWithGuard}
+					/>
+					<SelectionCitationBanner />
+					<BudgetBanner />
+					{allowQueueing && !isAdminMode && (
+						<ChatInputSuggestions
+							storyCreationEnabled={storyCreationEnabled}
+							isHidden={inputText.trim().length > 0}
+						/>
+					)}
+				</>
 			)}
-			{isAdminMode ? <ChatInputAdminBadge /> : variant === 'onboarding' ? <ChatInputOnboardingBadge /> : null}
+			{isAdminMode ? <ChatInputAdminBadge /> : null}
 
-			<form onSubmit={handleSubmitMessage} onKeyDown={handleKeyDown} className='mx-auto relative'>
+			{isManagedCreditsBlocked && (
+				<>
+					<ManagedCreditsExhausted
+						open={managedCreditDialogOpen}
+						onOpenChange={setManagedCreditDialogOpen}
+						canAddProviderKey={isAdmin}
+						creditOrganizationId={isOrgAdmin ? managedCredit.data?.organization?.id : undefined}
+					/>
+					<ManagedCreditsLockedComposer
+						isExample={mode === 'example'}
+						onOpen={() => setManagedCreditDialogOpen(true)}
+					/>
+				</>
+			)}
+			<form
+				onSubmit={handleSubmitMessage}
+				onKeyDown={handleKeyDown}
+				className={cn('mx-auto relative', isManagedCreditsBlocked && 'hidden')}
+			>
 				<InputGroup
 					htmlFor='chat-input'
 					className={cn(
 						'bg-background dark:bg-background shadow-xs border-none max-md:rounded-4xl',
 						isDragging && 'ring-2 ring-primary/50 border-primary',
 						isAdminMode && 'ring-4 ring-amber-500/60',
-						!isAdminMode && variant === 'onboarding' && 'ring-4 ring-foreground/10',
 					)}
 				>
-					{!isAdminMode && variant === 'default' && <ChatInputAnimatedBorder />}
+					{!isAdminMode && (variant === 'default' || variant === 'onboarding') && <ChatInputAnimatedBorder />}
 					<ChatInputAttachmentPreview
 						attachments={attachmentUpload.attachments}
 						rejection={attachmentUpload.rejection}
@@ -447,15 +690,18 @@ function ChatInputBase({
 					<input
 						ref={attachmentUpload.fileInputRef}
 						type='file'
-						accept={ATTACHMENT_ACCEPT}
+						accept={isTrial ? TRIAL_ATTACHMENT_ACCEPT : ATTACHMENT_ACCEPT}
 						multiple
-						disabled={isTrial}
 						className='hidden'
 						onChange={attachmentUpload.handleFileInputChange}
 					/>
 
 					<InputGroupAddon align='block-end'>
-						{(!isTranscribeReady || (!isRecording && !isTranscribing)) && <ChatInputModelSelect />}
+						{!isManagedCreditsBlocked &&
+							variant !== 'onboarding' &&
+							(!isTranscribeReady || (!isRecording && !isTranscribing)) && (
+								<ChatInputModelSelect isExample={mode === 'example'} />
+							)}
 
 						{isTranscribeReady && isRecording && <SlidingWaveform analyserRef={analyserRef} />}
 
@@ -463,6 +709,7 @@ function ChatInputBase({
 							{mode !== 'onboarding' && (
 								<ChatInputPlusMenu
 									hasDatabases={hasDatabases}
+									hasStoryReferences={storyReferenceOptions.length > 0}
 									hasSkills={hasSkills}
 									storyMentions={storyMentionOptions}
 									canChatWithNaoData={canChatWithNaoData}
@@ -474,8 +721,8 @@ function ChatInputBase({
 									onAddStory={(mention) => {
 										promptRef.current?.appendMention({ id: mention.id, label: mention.label }, '#');
 									}}
-									onOpenSkills={openSkillsMenu}
-									onOpenDatabase={openDatabaseMenu}
+									onOpenMentionMenu={openMentionMenu}
+									onOpenReferenceMenu={openReferenceMenu}
 									onFocusPrompt={() => promptRef.current?.focus()}
 								/>
 							)}
@@ -501,14 +748,14 @@ function ChatInputBase({
 							{allowQueueing && isRunning ? (
 								<ChatButton
 									showStop={isInputEmpty}
-									disabled={!isInputEmpty && isBudgetExceeded}
+									disabled={!isInputEmpty && isSendBlocked}
 									onClick={isInputEmpty ? cancelAgent : handleSubmitMessage}
 									type='button'
 								/>
 							) : (
 								<ChatButton
 									showStop={isRunning}
-									disabled={isLoadingMessages || isInputEmpty || (!isRunning && isBudgetExceeded)}
+									disabled={isLoadingMessages || isInputEmpty || (!isRunning && isSendBlocked)}
 									onClick={isRunning ? cancelAgent : handleSubmitMessage}
 									type='button'
 								/>
@@ -521,108 +768,56 @@ function ChatInputBase({
 	);
 }
 
+function ManagedCreditsLockedComposer({ isExample, onOpen }: { isExample: boolean; onOpen: () => void }) {
+	return (
+		<InputGroup className='mx-auto h-12 border-none bg-muted/50 shadow-xs dark:bg-muted/30 max-md:rounded-4xl'>
+			<button
+				type='button'
+				className='flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 text-left text-sm text-muted-foreground'
+				onClick={onOpen}
+			>
+				<LockKeyhole className='size-4 shrink-0' />
+				<span className='truncate'>
+					<span className='sm:hidden'>Credits required</span>
+					<span className='hidden sm:inline'>Credits required to continue chatting</span>
+				</span>
+			</button>
+			<div className='shrink-0 pr-4'>
+				<ChatInputModelSelect isExample={isExample} managedCreditsExhausted />
+			</div>
+		</InputGroup>
+	);
+}
+
+function ChatAllowanceExhausted({ scope }: { scope: ChatAllowanceExhaustedScope }) {
+	const isOnboarding = scope === 'onboarding';
+	if (!isOnboarding) {
+		return (
+			<div className='pb-2'>
+				<SuggestionCard
+					icon={<MessageCircleOff className='size-4 text-muted-foreground' />}
+					message='Example chat limit reached'
+					description='Set up your own project to keep chatting with your data.'
+				/>
+			</div>
+		);
+	}
+
+	return (
+		<Callout icon={MessageCircleOff} className='mb-3 rounded-2xl px-4 py-3 text-sm shadow-xs' role='status'>
+			<p className='font-medium text-foreground'>Guided setup chat limit reached</p>
+			<p className='mt-1 text-muted-foreground'>
+				Your progress is safe. Contact support if you need help completing setup.
+			</p>
+			<ContactSupportButton>Contact support</ContactSupportButton>
+		</Callout>
+	);
+}
+
 async function dataUrlToFile(url: string, mediaType: string, name: string): Promise<File> {
 	const response = await fetch(url);
 	const blob = await response.blob();
 	return new File([blob], name, { type: mediaType });
-}
-
-const CHAT_INPUT_BORDER_STROKE = 1;
-
-function ChatInputAnimatedBorder() {
-	const containerRef = useRef<HTMLSpanElement>(null);
-	const gradientId = useId();
-	const [{ width, height, radius }, setGeometry] = useState({ width: 0, height: 0, radius: 0 });
-	const [isFocused, setIsFocused] = useState(false);
-
-	useLayoutEffect(() => {
-		const element = containerRef.current;
-		if (!element) {
-			return;
-		}
-		const updateGeometry = () => {
-			setGeometry({
-				width: element.clientWidth,
-				height: element.clientHeight,
-				radius: readBorderRadius(element.parentElement),
-			});
-		};
-		updateGeometry();
-		const observer = new ResizeObserver(updateGeometry);
-		observer.observe(element);
-		return () => observer.disconnect();
-	}, []);
-
-	useEffect(() => {
-		const parent = containerRef.current?.parentElement;
-		if (!parent) {
-			return;
-		}
-		const handleFocusIn = () => setIsFocused(true);
-		const handleFocusOut = (event: FocusEvent) => {
-			const nextTarget = event.relatedTarget as Node | null;
-			if (nextTarget && parent.contains(nextTarget)) {
-				return;
-			}
-			setIsFocused(false);
-		};
-		setIsFocused(parent.contains(document.activeElement));
-		parent.addEventListener('focusin', handleFocusIn);
-		parent.addEventListener('focusout', handleFocusOut);
-		return () => {
-			parent.removeEventListener('focusin', handleFocusIn);
-			parent.removeEventListener('focusout', handleFocusOut);
-		};
-	}, []);
-
-	const hasSize = width > 0 && height > 0;
-	const inset = CHAT_INPUT_BORDER_STROKE / 2;
-	const strokeRadius = Math.max(radius - inset, 0);
-	const strokeColor = isFocused ? 'var(--primary)' : 'var(--muted-foreground)';
-
-	return (
-		<span ref={containerRef} aria-hidden='true' className='pointer-events-none absolute inset-0 z-10'>
-			{hasSize && (
-				<svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} fill='none'>
-					<defs>
-						<linearGradient id={gradientId} x1='0%' y1='0%' x2='0%' y2='100%'>
-							<stop
-								className='chat-input-border-stop'
-								offset='0%'
-								style={{ stopColor: strokeColor, stopOpacity: isFocused ? 0.35 : 0.25 }}
-							/>
-							<stop
-								className='chat-input-border-stop'
-								offset='100%'
-								style={{ stopColor: strokeColor, stopOpacity: isFocused ? 1 : 0.4 }}
-							/>
-						</linearGradient>
-					</defs>
-					<rect
-						className='chat-input-border-path'
-						x={inset}
-						y={inset}
-						width={width - CHAT_INPUT_BORDER_STROKE}
-						height={height - CHAT_INPUT_BORDER_STROKE}
-						rx={strokeRadius}
-						ry={strokeRadius}
-						pathLength={100}
-						stroke={`url(#${gradientId})`}
-						strokeWidth={CHAT_INPUT_BORDER_STROKE}
-						strokeLinecap='round'
-					/>
-				</svg>
-			)}
-		</span>
-	);
-}
-
-function readBorderRadius(element: HTMLElement | null): number {
-	if (!element) {
-		return 0;
-	}
-	const radius = parseFloat(getComputedStyle(element).borderTopLeftRadius);
-	return Number.isFinite(radius) ? radius : 0;
 }
 
 function ChatInputAdminBadge() {
@@ -649,69 +844,63 @@ function ChatInputAdminBadge() {
 	);
 }
 
-function ChatInputOnboardingBadge() {
-	return (
-		<div className='flex justify-end pr-4'>
-			<span className='mb-1 flex w-fit items-center rounded-t-lg bg-foreground/10 px-2 py-0.5 text-[10px] font-medium text-muted-foreground'>
-				Onboarding
-			</span>
-		</div>
-	);
-}
-
 function BudgetBanner() {
 	const { error, clearError, selectedModel } = useAgentContext();
-	const prevProviderRef = useRef(selectedModel?.provider);
+	const project = useQuery(trpc.project.getCurrent.queryOptions());
+	const hasProject = project.data != null;
+	const selectedProvider = selectedModel?.provider;
+	const prevProviderRef = useRef(selectedProvider);
 
 	useEffect(() => {
 		const prev = prevProviderRef.current;
-		prevProviderRef.current = selectedModel?.provider;
-		if (prev && prev !== selectedModel?.provider && parseBudgetError(error)) {
+		prevProviderRef.current = selectedProvider;
+		if (prev && prev !== selectedProvider && (parseBudgetError(error) || parseManagedCreditsError(error))) {
 			clearError();
 		}
-	}, [selectedModel?.provider, error, clearError]);
+	}, [selectedProvider, error, clearError]);
 
+	const isManaged = selectedModel?.provider === 'nao';
 	const budgetStatus = useQuery({
 		...trpc.budget.checkBudgetStatus.queryOptions({ provider: selectedModel?.provider ?? 'openai' }),
-		enabled: !!selectedModel?.provider,
-		refetchOnWindowFocus: false,
+		enabled: hasProject && !!selectedModel?.provider && !isManaged,
+		refetchOnWindowFocus: 'always',
 	});
 
-	const errorMessage = parseBudgetError(error);
-	const level = errorMessage ? 'exceeded' : (budgetStatus.data?.level ?? 'ok');
-	const proactiveMessage = level !== 'ok' ? budgetStatus.data?.message : null;
-	const message = errorMessage ?? proactiveMessage;
+	const budgetError = parseBudgetError(error);
+	const budgetLevel = budgetError ? 'exceeded' : (budgetStatus.data?.level ?? 'ok');
+	const budgetMessage = budgetError ?? (budgetLevel !== 'ok' ? budgetStatus.data?.message : null);
 
-	if (!message) {
+	if (!budgetMessage) {
 		return null;
 	}
 
-	const isExceeded = level === 'exceeded';
+	const isExceeded = budgetLevel === 'exceeded';
 
 	return (
 		<div className='mb-2 flex items-start gap-2.5 rounded-2xl border border-input/50 bg-muted/50 px-3 py-2.5 text-sm text-muted-foreground animate-in fade-in slide-in-from-bottom-2 duration-200'>
 			<AlertTriangle className={cn('size-4 shrink-0 mt-0.5', isExceeded ? 'text-red-500' : 'text-amber-500')} />
-			<p className='flex-1 min-w-0'>{message}</p>
+			<p className='flex-1 min-w-0'>{budgetMessage}</p>
 		</div>
 	);
 }
 
 function ChatInputPlusMenu({
 	hasDatabases,
+	hasStoryReferences,
 	hasSkills,
 	storyMentions,
 	canChatWithNaoData,
 	isAdminMode,
 	adminModeLocked,
-	isTrial,
 	onSelectAdminMode,
 	onAddAttachment,
 	onAddStory,
-	onOpenSkills,
-	onOpenDatabase,
+	onOpenMentionMenu,
+	onOpenReferenceMenu,
 	onFocusPrompt,
 }: {
 	hasDatabases: boolean;
+	hasStoryReferences: boolean;
 	hasSkills: boolean;
 	storyMentions: MentionOption[];
 	canChatWithNaoData: boolean;
@@ -721,10 +910,27 @@ function ChatInputPlusMenu({
 	onSelectAdminMode: () => void;
 	onAddAttachment: () => void;
 	onAddStory: (mention: MentionOption) => void;
-	onOpenSkills: () => void;
-	onOpenDatabase: () => void;
+	onOpenMentionMenu: (trigger: string) => void;
+	onOpenReferenceMenu: (rootId: string) => void;
 	onFocusPrompt: () => void;
 }) {
+	const pendingMentionMenuRef = useRef<(() => void) | null>(null);
+
+	/** The menu takes focus back while closing, so the mention menu is opened once the prompt has it again. */
+	const deferMentionMenu = (openMentionMenu: () => void) => {
+		pendingMentionMenuRef.current = openMentionMenu;
+	};
+
+	const restorePromptFocus = () => {
+		const openPendingMentionMenu = pendingMentionMenuRef.current;
+		pendingMentionMenuRef.current = null;
+		if (openPendingMentionMenu) {
+			openPendingMentionMenu();
+		} else {
+			onFocusPrompt();
+		}
+	};
+
 	return (
 		<DropdownMenu>
 			<DropdownMenuTrigger asChild>
@@ -743,19 +949,23 @@ function ChatInputPlusMenu({
 				className='min-w-44'
 				onCloseAutoFocus={(e) => {
 					e.preventDefault();
-					requestAnimationFrame(onFocusPrompt);
+					requestAnimationFrame(restorePromptFocus);
 				}}
 			>
-				{!isTrial && (
-					<DropdownMenuItem onSelect={onAddAttachment}>
-						<Paperclip className='size-4' />
-						<span>Attach file</span>
-					</DropdownMenuItem>
-				)}
+				<DropdownMenuItem onSelect={onAddAttachment}>
+					<Paperclip className='size-4' />
+					<span>Attach file</span>
+				</DropdownMenuItem>
 				{hasDatabases && (
-					<DropdownMenuItem onSelect={onOpenDatabase}>
+					<DropdownMenuItem onSelect={() => deferMentionMenu(() => onOpenReferenceMenu(TABLES_ROOT_ID))}>
 						<Database className='size-4' />
 						<span>Database tables</span>
+					</DropdownMenuItem>
+				)}
+				{hasStoryReferences && (
+					<DropdownMenuItem onSelect={() => deferMentionMenu(() => onOpenReferenceMenu(STORIES_ROOT_ID))}>
+						<Library className='size-4' />
+						<span>Reference stories</span>
 					</DropdownMenuItem>
 				)}
 				{storyMentions.map((mention) => (
@@ -765,7 +975,7 @@ function ChatInputPlusMenu({
 					</DropdownMenuItem>
 				))}
 				{hasSkills && (
-					<DropdownMenuItem onSelect={onOpenSkills}>
+					<DropdownMenuItem onSelect={() => deferMentionMenu(() => onOpenMentionMenu(SKILL_MENTION_TRIGGER))}>
 						<PencilRuler className='size-4' />
 						<span>Skills</span>
 					</DropdownMenuItem>
@@ -787,6 +997,24 @@ function ChatInputPlusMenu({
 			</DropdownMenuContent>
 		</DropdownMenu>
 	);
+}
+
+function buildShortcutPlaceholder({
+	hasContext,
+	hasSkills,
+	hasStoryMode,
+}: {
+	hasContext: boolean;
+	hasSkills: boolean;
+	hasStoryMode: boolean;
+}): string {
+	const shortcuts = [
+		hasContext && `${DATABASE_MENTION_TRIGGER} context`,
+		hasSkills && `${SKILL_MENTION_TRIGGER} skills`,
+		hasStoryMode && `${story.MENTION_TRIGGER} story mode`,
+	].filter(Boolean);
+	const base = 'Ask anything about your data';
+	return shortcuts.length > 0 ? `${base}, ${shortcuts.join(', ')}` : `${base}...`;
 }
 
 function RecordingTimer() {

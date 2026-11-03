@@ -12,10 +12,10 @@ import {
 	getProjectNameFromPath,
 	readProjectNameFromConfig,
 	replaceExistingProject,
-} from '../utils/project-import.utils';
+} from '../services/project-import.service';
 import {
 	cloudBillingAdminProcedure,
-	cloudBillingOrganizationProcedure,
+	cloudBillingProjectImportProcedure,
 	contextAdminProtectedProcedure,
 	protectedProcedure,
 } from './trpc';
@@ -61,7 +61,7 @@ export const githubRoutes = {
 			}
 		}),
 
-	createProjectFromRepo: cloudBillingOrganizationProcedure
+	createProjectFromRepo: cloudBillingProjectImportProcedure
 		.input(
 			z.object({
 				repoFullName: z.string(),

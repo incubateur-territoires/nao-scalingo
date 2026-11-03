@@ -11,6 +11,7 @@ import type { JSONValue } from 'ai';
 import type { OllamaChatProviderOptions } from 'ai-sdk-ollama';
 import { z } from 'zod/v4';
 
+import type { ManagedAiUsageContext } from '../agents/managed-ai';
 import type { ProviderModelResult } from '../agents/providers';
 import { TokenCost } from './chat';
 
@@ -103,8 +104,10 @@ export type ModelInferenceSettings = z.infer<typeof modelInferenceSettingsSchema
 export const modelSettingsMapSchema = z.record(z.string(), modelInferenceSettingsSchema);
 export type ModelSettingsMap = z.infer<typeof modelSettingsMapSchema>;
 
-/** Where a project's models and their credentials come from: its database config, nao_config.yaml or the environment. */
+/** Where a project's models and their credentials come from: its database config, nao_config.yaml, the environment, or nao. */
 export type ModelSource = {
+	/** Serves the providers nao runs on its own keys. */
+	readonly managed?: boolean;
 	listProviders(projectId: string): Promise<ProviderModelSource[]>;
 	resolveModel(request: ModelRequest): Promise<ProviderModelResult | null>;
 	/** Credentials for calling the provider directly. A source that must wrap every call leaves it out. */
@@ -123,6 +126,7 @@ export type ModelRequest = {
 	provider: LlmProvider;
 	modelId: string;
 	applyUserSettings: boolean;
+	usageContext?: ManagedAiUsageContext;
 };
 
 /** How a model exposes "thinking"/reasoning control, if at all. */
@@ -236,6 +240,7 @@ export type OpenAICompatibleProvider = 'qwen' | 'minimax' | 'moonshot' | 'meta' 
 
 /** Map each provider kind to its specific config type */
 export type ProviderConfigMap = {
+	nao: OpenAIResponsesProviderOptions;
 	google: GoogleGenerativeAIProviderOptions;
 	openai: OpenAIResponsesProviderOptions;
 	anthropic: Omit<AnthropicProviderOptions, 'fallbacks'>;
@@ -294,12 +299,14 @@ export type ProviderAuth = {
 /** Data-only provider config (no SDK imports, safe for frontend) */
 export type ProviderMeta<P extends LlmProviderKind> = {
 	auth: ProviderAuth;
-	envVar: string;
+	envVar?: string;
 	baseUrlEnvVar?: string;
 	/** Endpoint used when neither the config nor the environment sets a base URL. */
 	defaultBaseUrl?: string;
 	/** Set when the provider has no vendor endpoint to fall back on, so a base URL must be supplied. */
 	requiresBaseUrl?: boolean;
+	/** Set when nao runs the provider on its own keys and bills it through credits, so projects cannot configure it. */
+	managed?: boolean;
 	models: readonly ProviderModel<P>[];
 	extractorModelId: string;
 	summaryModelId: string;

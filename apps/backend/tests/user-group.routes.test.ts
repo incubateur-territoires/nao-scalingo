@@ -19,7 +19,7 @@ const mocks = vi.hoisted(() => ({
 	listUserGroups: vi.fn(),
 	previewProjectWideShareRevocation: vi.fn(),
 	revokeUnauthorizedProjectWideShares: vi.fn(),
-	env: {} as Record<string, string | undefined>,
+	env: { BETTER_AUTH_URL: 'http://localhost:5005/' } as Record<string, string | undefined>,
 	resolveUserGroupAccess: vi.fn(),
 	role: 'admin' as 'admin' | 'user' | 'viewer',
 	setGroupBudget: vi.fn(),

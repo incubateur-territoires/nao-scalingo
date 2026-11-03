@@ -83,10 +83,6 @@ export type StorySubscriptionNotificationPayload = {
 	ownerName: string;
 };
 
-export const DEFAULT_PYTHON_EXECUTION_DURATION_SECS = 30;
-export const MIN_PYTHON_EXECUTION_DURATION_SECS = 1;
-export const MAX_PYTHON_EXECUTION_DURATION_SECS = 600;
-
 export const MAX_PRELOADED_SKILLS = 50;
 
 /** Sandbox secrets are exposed to code as environment variables, so their names must be valid POSIX identifiers. */
@@ -149,6 +145,7 @@ export type ChatReplayFeedbackState = (typeof CHAT_REPLAY_FEEDBACK_STATES)[numbe
 export const NO_CACHE_SCHEDULE = 'no-cache';
 
 export const LLM_PROVIDERS = [
+	'nao',
 	'openai',
 	'anthropic',
 	'google',
@@ -167,6 +164,7 @@ export const LLM_PROVIDERS = [
 ] as const;
 
 export const providerLabels: Record<LlmProviderKind, string> = {
+	nao: 'nao',
 	openai: 'OpenAI',
 	anthropic: 'Anthropic',
 	google: 'Google',

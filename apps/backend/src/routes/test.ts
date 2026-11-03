@@ -5,8 +5,8 @@ import { z } from 'zod/v4';
 import { executeQuery } from '../agents/tools/execute-sql';
 import type { App } from '../app';
 import { noProjectMessage } from '../env';
-import { authMiddleware } from '../middleware/auth';
-import { retrieveProjectById } from '../queries/project.queries';
+import { sessionOrApiKeyAuthMiddleware } from '../middleware/auth';
+import { getUserRoleInProject, retrieveProjectById } from '../queries/project.queries';
 import { hasFeature, LICENSE_FEATURES } from '../services/license.service';
 import { getAzureAccessTokenForUser } from '../services/microsoft-auth.service';
 import { getProjectRuntimeEnvVars } from '../services/project-runtime-env';
@@ -31,7 +31,7 @@ const describeRunError = (err: unknown): string => {
 };
 
 export const testRoutes = async (app: App) => {
-	app.addHook('preHandler', authMiddleware);
+	app.addHook('preHandler', sessionOrApiKeyAuthMiddleware);
 
 	/**
 	 * Run a single prompt without persisting to a chat.
@@ -64,6 +64,10 @@ export const testRoutes = async (app: App) => {
 			if (!projectId) {
 				return reply.status(400).send({ error: noProjectMessage() });
 			}
+			const userRole = await getUserRoleInProject(projectId, userId);
+			if (!userRole || userRole === 'viewer') {
+				return reply.status(403).send({ error: 'Viewers cannot run tests' });
+			}
 
 			try {
 				const modelSelection = model as LlmSelectedModel | undefined;
@@ -78,6 +82,7 @@ export const testRoutes = async (app: App) => {
 					);
 					const verified = await testAgentService.runVerification(
 						projectId,
+						userId,
 						prompt,
 						result,
 						expectedColumns,
