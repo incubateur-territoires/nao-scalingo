@@ -341,9 +341,9 @@ Les conflits ne peuvent venir que de deux endroits. D'abord les **trois fichiers
 (cf. tableau de l'overlay) : `package.json` (garder `heroku-postbuild`), `.gitignore` (garder
 `.env.fgp`) et `README.md` (garder le bandeau). Ensuite les **workflows d'amont retirés** d'ici
 (`docker.yml`, `publish.yml`, `pr-preview.yml`, `pr-gate.yml`, `issue-gate.yml`,
-`approve-contributor.yml`, `remove-old-artifacts.yml`) : si amont en modifie un, git remonte un
-conflit « deleted by us / modified by them » → **garder supprimé**. Tout le reste de l'overlay est
-en fichiers neufs, donc intouchable par amont.
+`approve-contributor.yml`, `remove-old-artifacts.yml`, `cloud-preprod.yml`) : si amont en modifie
+un, git remonte un conflit « deleted by us / modified by them » → **garder supprimé**. Tout le
+reste de l'overlay est en fichiers neufs, donc intouchable par amont.
 
 Avant de pousser, vérifier que l'arbre vaut bien **amont + overlay, et rien d'autre** — c'est le
 contrôle qui attrape une résolution de conflit bancale :
@@ -402,6 +402,12 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://nao-<produit>.osc-secnum-fr1.s
 ./nao-scalingo.sh logs <produit> 200 | grep -iE 'Migrations|error|✗'
 ```
 
+> **Derrière un proxy filtrant** (bac à sable d'agent) : l'archive ne passe **pas** par le proxy
+> FGP. `POST /v1/sources` rend une URL pré-signée sur le stockage objet de Scalingo,
+> `scalingo-api-sources-osc-secnum-fr1.s3.eu-west-3.amazonaws.com`, et `curl` l'attaque en direct.
+> Si cet hôte n'est pas joignable, `deploy` échoue tout de suite après « Déploiement de … » sur
+> `curl: (56) CONNECT tunnel failed, response 403` — ce n'est ni le blob ni Scalingo.
+
 Une fois l'instance saine, et **seulement** là, avancer `main` puis la pousser.
 
 ### Vérifier le code : ni CI ni lint ici
@@ -413,7 +419,7 @@ General de l'**organisation**). `js-lint`, `js-test` et `cli-lint` ne tournent d
 la présence des workflows dans `.github/` : aucun run depuis la création du fork.
 
 Le jour où ce blocage est levé, les workflows deviennent vivants **d'un coup** : ils sont tous
-enregistrés et marqués `active`, pas dormants. C'est pourquoi les sept qui n'ont pas de sens sur un
+enregistrés et marqués `active`, pas dormants. C'est pourquoi les huit qui n'ont pas de sens sur un
 fork de déploiement ont déjà été **retirés du dépôt** (cf. § 1, ils sont la 2ᵉ source de conflits à
 la synchro) : `docker.yml` se déclenchait sur chaque push vers `main` — donc à chaque synchro — et
 `publish.yml` sur les tags `v*`, que le fork porte déjà. Restent `js-lint`, `js-test`, `cli-lint`,
