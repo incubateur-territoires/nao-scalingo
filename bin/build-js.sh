@@ -24,6 +24,9 @@ DUCKDB_EXTENSION_DIR="$PWD/.duckdb-extensions" bun docker/install-duckdb-extensi
 # bun n'a alors plus à transpiler tout le graphe de modules au boot (cf. timeout 60s Scalingo).
 # Best-effort (non bloquant) ; utilisé au runtime seulement si NAO_USE_BUNDLE=true (cf. bin/web.sh).
 # Les natifs sont externalisés (résolus depuis node_modules au runtime), comme `build:standalone` amont.
+# L'outil codemode (actif par défaut) résout son worker en relatif du fichier exécuté :
+# depuis le bundle, './worker.mjs' pointe dans dist/. L'amont le recopie dans son propre
+# script `build` ; on fait pareil, sinon codemode casse dès que NAO_USE_BUNDLE=true.
 echo "Bundling backend (cold-start optimization)…"
 bun build apps/backend/src/cli.ts \
   --target bun \
@@ -32,8 +35,8 @@ bun build apps/backend/src/cli.ts \
   --external playwright-core \
   --external puppeteer-core \
   --external '@boxlite-ai/boxlite' \
-  --external '@pydantic/monty' \
   --external '@duckdb/node-bindings' \
   --external '@vscode/ripgrep' \
+  && cp apps/backend/src/services/codemode/worker.mjs apps/backend/dist/worker.mjs \
   && echo "✓ backend bundle: apps/backend/dist/cli.js" \
   || echo "ℹ backend bundle échoué (non bloquant ; runtime utilisera 'bun run src/cli.ts')"
